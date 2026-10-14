@@ -151,7 +151,8 @@
     }
     .bubble.action.app_disabled,
     .bubble.action.os_denied,
-    .bubble.action.needs_permission {
+    .bubble.action.needs_permission,
+    .bubble.action.needs_connection {
       background: var(--color-danger-subtle);
       border-color: var(--color-danger);
       color: var(--color-danger);
@@ -695,6 +696,24 @@
 
     <div class="sp-divider"></div>
 
+    <!-- Google Calendar connection (G3) — status + Connect/Disconnect.
+         Fetched fresh on every settings-popup open (not just the first,
+         unlike the persona/voice/avatar data above) since the connection
+         can complete in the system browser while this popup is already
+         open. The refresh token itself never reaches this page — only
+         {connected, scopes, connected_at} ever come back from the backend. -->
+    <div class="sp-section">
+      <div class="sp-row" id="googleCalRow">
+        <div class="sp-copy">
+          <span class="sp-title">Google Calendar</span>
+          <span class="sp-help" id="googleCalStatus">Checking…</span>
+        </div>
+        <button type="button" class="sp-forget-btn" id="googleCalBtn">Connect</button>
+      </div>
+    </div>
+
+    <div class="sp-divider"></div>
+
     <!-- Learned scheduling preferences (S5) — buried, collapsed by
          default like calendar's "manage individual permissions". Fetched
          and rendered lazily on open (see the 'toggle' listener below), not
@@ -709,7 +728,10 @@
   </div>
 
   <script>
-  const LIVE_WS = 'ws://localhost:8765';
+  // Local dev: ws://localhost:8765. Cloud deploy: wss://<DOMAIN>/ws, via
+  // PISTACHIO_WS_BASE (see electron-app/config.js) — preload exposes it as
+  // a plain value since config.js is static, read once at preload time.
+  const LIVE_WS = window.electronAPI?.voiceWsUrl || 'ws://localhost:8765';
 
   // Display name from verified session — never hardcoded.
   let USERNAME = 'user';
@@ -742,10 +764,14 @@
   // delete_event()/move_event() turn comes back "disambiguate" (candidates
   // the user must pick between), cleared on any resolution (success, a
   // dropped-out escape hatch, or any other terminal calendar status).
+  // Also set (G4) whenever a delete_by_uid()/move_by_uid() turn comes back
+  // "recurring_choice" — the target resolved to one occurrence, but Google
+  // needs an explicit this-vs-series pick before it will act.
   // null | { kind, mode, candidate?, candidates, newStart?, newEnd? }
   //   kind "delete" | "move" — which action a confirmed pick actually runs
-  //   mode "list"    — showing/awaiting a pick among 2+ candidates
-  //   mode "confirm" — awaiting yes/no on ONE specific candidate
+  //   mode "list"      — showing/awaiting a pick among 2+ candidates
+  //   mode "confirm"   — awaiting yes/no on ONE specific candidate
+  //   mode "recurring" — awaiting this/all on ONE recurring occurrence (G4)
   //   newStart/newEnd — move only: the originally-requested destination
   //     time, carried through disambiguation so a resolved pick still
   //     applies the intended new time (see doMove).
@@ -784,11 +810,12 @@
 
   // Renders a FINISHED tool outcome only — never a pending/optimistic state.
   const ACTION_GLYPHS = {
-    success:          '✓',
-    app_disabled:     '🔒',
-    os_denied:        '🔒',
-    needs_permission: '🔒',
-    error:            '⚠',
+    success:           '✓',
+    app_disabled:      '🔒',
+    os_denied:         '🔒',
+    needs_permission:  '🔒',
+    needs_connection:  '🔒',
+    error:             '⚠',
   };
 
   function addActionBubble(text, status) {
@@ -834,6 +861,8 @@
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
       case 'needs_permission':
         return 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
+      case 'needs_connection':
+        return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "error", plus any status this build doesn't know yet
         return action.kind === 'list'
           ? "couldn't check your calendar right now"
@@ -961,6 +990,9 @@
   //   success: {status, kind:"delete", title, start}
   //   ambiguous: {status:"ambiguous", kind:"delete",
   //               candidates:[{uid,title,start,calendar,all_day}]}
+  //   recurring_choice (G4, google-only): {status:"recurring_choice",
+  //     kind:"delete", candidates:[<the one occurrence>]} — re-call
+  //     delete_by_uid with scope:"instance"|"series" once the user picks.
   //   otherwise: {status, kind:"delete", message, title?, start?}
   // Candidates can now span multiple days (the widened today..+7 search
   // window), so each one must show its DAY, not just a clock time —
@@ -978,6 +1010,8 @@
         return "you haven't given me calendar permission — turn it on in Settings";
       case 'os_denied':
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
+      case 'needs_connection':
+        return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "not_found", "recurring_unsupported", "error"
         return action.message || "couldn't delete that event";
     }
@@ -989,6 +1023,11 @@
   //     (start/end here are the NEW time — formatEventWhen renders it the
   //     same way create's success does.)
   //   disambiguate: {status:"disambiguate", kind:"move", candidates, approximate, new_start, new_end?}
+  //   recurring_choice (G4, google-only): {status:"recurring_choice",
+  //     kind:"move", candidates:[<the one occurrence>], new_start, new_end?}
+  //     — re-call move_by_uid with scope:"instance"|"series" once the user
+  //     picks; new_start/new_end ride along so the pick still applies the
+  //     originally-requested destination time.
   //   otherwise: {status, kind:"move", message, title?, start?}
   function calendarMoveActionText(action) {
     switch (action.status) {
@@ -1002,6 +1041,8 @@
         return "you haven't given me calendar permission — turn it on in Settings";
       case 'os_denied':
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
+      case 'needs_connection':
+        return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "not_found", "recurring_unsupported", "error"
         return action.message || "couldn't move that event";
     }
@@ -1120,6 +1161,8 @@
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
       case 'needs_permission':
         return 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
+      case 'needs_connection':
+        return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "error"
         return action.message || "couldn't put together a plan for that";
     }
@@ -1149,6 +1192,8 @@
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
       case 'needs_permission':
         return 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
+      case 'needs_connection':
+        return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "error"
         return action.message || "couldn't add those";
     }
@@ -1239,6 +1284,29 @@
     return /^\s*(n|no|nope|nah|not that one|wrong|cancel)\s*[.!]?\s*$/i.test(text);
   }
 
+  // G4: a delete/move target turned out to be a recurring event, and
+  // neither delete_by_uid/move_by_uid will act on it without an explicit
+  // instance-vs-series choice (see core/calendar_google.py's
+  // "recurring_choice" status). These two are the ONLY replies
+  // disambig.mode === 'recurring' recognizes — anything else (including
+  // an explicit "cancel") falls through looksLikeDisambiguation to the
+  // existing escape hatch, same as a disambiguation reply that doesn't
+  // look like a pick.
+  function isThisOne(text) {
+    return /^\s*(this|this one|just this one|only this one|this occurrence|this instance)\s*[.!]?\s*$/i.test(text);
+  }
+
+  function isAllSeries(text) {
+    return /^\s*(all|everything|all of them|the (whole )?series)\s*[.!]?\s*$/i.test(text);
+  }
+
+  // Mirrors confirmPromptText/moveConfirmPromptText's one-candidate
+  // framing — the occurrence IS the candidate here, there's nothing to
+  // disambiguate between, only this-vs-series to choose.
+  function recurringChoicePromptText(c) {
+    return `that's a repeating event — just this one (${candidateLine(c)}), or the whole series? (this / all / cancel)`;
+  }
+
   // Deterministic follow-up resolution — no model call. Tries, in order:
   // explicit ordinal/index, earlier/later, an explicit clock time (if it
   // uniquely picks one candidate), then a retyped/partial title matched by
@@ -1292,6 +1360,12 @@
   // let it flow through as a normal chat message. Never trap the user in
   // a "which one?" loop.
   function looksLikeDisambiguation(text, state) {
+    // G4: a 'recurring' prompt only ever accepts this/all — anything else
+    // (including an explicit "cancel") is NOT recognized here, so it falls
+    // through to sendMessage's normal escape hatch below.
+    if (state.mode === 'recurring') {
+      return isThisOne(text) || isAllSeries(text);
+    }
     if (isYes(text) || isNo(text)) return true;
     return resolveFollowUp(text, state.candidates) !== null;
   }
@@ -1300,11 +1374,14 @@
   // — always called after an explicit yes/no confirm (see sendMessage),
   // never directly from a guess. Same guarded endpoint as the executor's
   // own auto-act path; no unguarded delete path exists on the client.
-  async function doDelete(candidate) {
+  // scope (G4): undefined for a non-recurring target (unchanged); "instance"
+  // | "series" once a recurring_choice prompt has been answered — see
+  // handleDisambiguationReply's 'recurring' mode branch.
+  async function doDelete(candidate, scope) {
     disambig = null;
     setTyping(true);
     try {
-      const result = await window.electronAPI.deleteByUid(candidate.uid, candidate.calendar);
+      const result = await window.electronAPI.deleteByUid(candidate.uid, candidate.calendar, scope || null);
       setTyping(false);
       addActionBubble(calendarDeleteActionText(result), result.status);
     } catch (e) {
@@ -1321,11 +1398,12 @@
   // duration-preserving end itself when it's omitted, same as move_event's
   // own auto-act path. Same guarded endpoint as the executor's own
   // auto-act path; no unguarded move path exists on the client.
-  async function doMove(candidate, newStart, newEnd) {
+  // scope (G4): see doDelete above — same semantics.
+  async function doMove(candidate, newStart, newEnd, scope) {
     disambig = null;
     setTyping(true);
     try {
-      const result = await window.electronAPI.moveByUid(candidate.uid, candidate.calendar, newStart, newEnd || null);
+      const result = await window.electronAPI.moveByUid(candidate.uid, candidate.calendar, newStart, newEnd || null, scope || null);
       setTyping(false);
       addActionBubble(calendarMoveActionText(result), result.status);
     } catch (e) {
@@ -1599,6 +1677,13 @@
   // happens on a "yes" and how the confirm prompt is worded differs.
   async function handleDisambiguationReply(text) {
     const { kind, candidates, newStart, newEnd } = disambig;
+    if (disambig.mode === 'recurring') {
+      // looksLikeDisambiguation already gated this to this/all only.
+      const scope = isThisOne(text) ? 'instance' : 'series';
+      if (kind === 'move') { await doMove(disambig.candidate, newStart, newEnd, scope); }
+      else                 { await doDelete(disambig.candidate, scope); }
+      return;
+    }
     if (disambig.mode === 'confirm') {
       if (isYes(text)) {
         if (kind === 'move') { await doMove(disambig.candidate, newStart, newEnd); }
@@ -1685,6 +1770,12 @@
         } else if (action.kind === 'list' && action.status === 'success') {
           addActionBubble(calendarListActionBoxText(action), action.status);
           addBubble(calendarListSummaryText(action), false);
+        } else if (action.kind === 'delete' && action.status === 'recurring_choice') {
+          // G4: the target IS the one occurrence resolved — no delete
+          // happened yet, only the this-vs-series choice is pending.
+          const candidates = action.candidates || [];
+          disambig = { kind: 'delete', mode: 'recurring', candidate: candidates[0], candidates };
+          addBubble(recurringChoicePromptText(candidates[0]), false);
         } else if (action.kind === 'delete' && action.status === 'disambiguate') {
           // No delete happened — never does, from this status alone.
           const candidates = action.candidates || [];
@@ -1697,6 +1788,15 @@
           }
         } else if (action.kind === 'delete') {
           addActionBubble(calendarDeleteActionText(action), action.status);
+        } else if (action.kind === 'move' && action.status === 'recurring_choice') {
+          // G4: same as delete's recurring_choice above, but the pending
+          // new_start/new_end ride along so the eventual doMove call still
+          // applies the originally-requested destination time.
+          const candidates = action.candidates || [];
+          const newStart = action.new_start || null;
+          const newEnd   = action.new_end || null;
+          disambig = { kind: 'move', mode: 'recurring', candidate: candidates[0], candidates, newStart, newEnd };
+          addBubble(recurringChoicePromptText(candidates[0]), false);
         } else if (action.kind === 'move' && action.status === 'disambiguate') {
           // No move happened — never does, from this status alone. The
           // originally-requested new_start/new_end ride along on the
@@ -2179,6 +2279,9 @@
     settingsOverlay.classList.add('is-open');
     accountBtn.classList.add('is-open');
     if (!overlayLoaded) { overlayLoaded = true; _loadOverlayData(); }
+    // Every open, not gated by overlayLoaded — the connection can complete
+    // in the system browser while this popup was already loaded once.
+    _loadGoogleConnectionStatus();
   }
 
   function closeOverlay() {
@@ -2343,6 +2446,101 @@
   document.getElementById('calListToggle').addEventListener('change', _saveCalendarPermissions);
   document.getElementById('calMoveToggle').addEventListener('change', _saveCalendarPermissions);
   document.getElementById('calDeleteToggle').addEventListener('change', _saveCalendarPermissions);
+
+  // ── Google Calendar connection (G3) ───────────────────────────────────────
+  // Status + Connect/Disconnect. The refresh token never reaches this page —
+  // only {connected, scopes, connected_at} ever come back from the backend
+  // (db.fetch_google_connection is structurally incapable of returning the
+  // token; see its docstring).
+  const googleCalStatus = document.getElementById('googleCalStatus');
+  const googleCalBtn    = document.getElementById('googleCalBtn');
+  let googlePollTimer = null;
+
+  function _stopGooglePoll() {
+    if (googlePollTimer) { clearInterval(googlePollTimer); googlePollTimer = null; }
+  }
+
+  function _renderGoogleConnection(status) {
+    if (status.connected) {
+      const when = status.connected_at ? new Date(status.connected_at) : null;
+      const whenText = when && !isNaN(when)
+        ? ` since ${when.toLocaleDateString([], { month: 'short', day: 'numeric' })}`
+        : '';
+      googleCalStatus.textContent = `Connected${whenText}`;
+      googleCalBtn.textContent = 'Disconnect';
+      googleCalBtn.dataset.action = 'disconnect';
+    } else {
+      googleCalStatus.textContent = 'Not connected';
+      googleCalBtn.textContent = 'Connect';
+      googleCalBtn.dataset.action = 'connect';
+    }
+  }
+
+  async function _loadGoogleConnectionStatus() {
+    try {
+      const status = await window.electronAPI.googleConnectionStatus();
+      _renderGoogleConnection(status);
+    } catch (err) {
+      console.error('[settings] googleConnectionStatus failed:', err);
+      googleCalStatus.textContent = "couldn't check connection";
+    }
+  }
+
+  // Connect: opens the system browser, then polls status every ~2s
+  // (bounded, ~2 min / 60 polls) until it flips to connected — the OAuth
+  // consent + callback happen entirely outside this app's own windows.
+  async function _startGoogleConnect() {
+    googleCalStatus.textContent = 'Waiting for Google…';
+    googleCalBtn.disabled = true;
+    try {
+      await window.electronAPI.googleConnectStart();
+    } catch (err) {
+      console.error('[settings] googleConnectStart failed:', err);
+      googleCalStatus.textContent = "couldn't start connecting — try again";
+      googleCalBtn.disabled = false;
+      return;
+    }
+    let polls = 0;
+    _stopGooglePoll();
+    googlePollTimer = setInterval(async () => {
+      polls += 1;
+      let status;
+      try {
+        status = await window.electronAPI.googleConnectionStatus();
+      } catch (err) {
+        console.error('[settings] googleConnectionStatus poll failed:', err);
+        return;
+      }
+      if (status.connected) {
+        _stopGooglePoll();
+        googleCalBtn.disabled = false;
+        _renderGoogleConnection(status);
+        return;
+      }
+      if (polls >= 60) {
+        _stopGooglePoll();
+        googleCalBtn.disabled = false;
+        googleCalStatus.textContent = "didn't connect — try again";
+      }
+    }, 2000);
+  }
+
+  async function _disconnectGoogle() {
+    if (!window.confirm('Disconnect Google Calendar?')) return;
+    googleCalBtn.disabled = true;
+    try {
+      await window.electronAPI.googleDisconnect();
+    } catch (err) {
+      console.error('[settings] googleDisconnect failed:', err);
+    }
+    googleCalBtn.disabled = false;
+    await _loadGoogleConnectionStatus();
+  }
+
+  googleCalBtn.addEventListener('click', () => {
+    if (googleCalBtn.dataset.action === 'disconnect') _disconnectGoogle();
+    else _startGoogleConnect();
+  });
 
   // ── Learned scheduling preferences (S5) — see/reset valve ────────────────
   // Touches NO calendar: no permission gate applies to any of this, on

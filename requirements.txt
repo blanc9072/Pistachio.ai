@@ -1,3 +1,6 @@
+# Cross-platform deps only — installs cleanly on Linux (the Phase 2 VPS)
+# as well as macOS. macOS-only extras (pyobjc/EventKit, for the eventkit
+# calendar backend) live in requirements-macos.txt instead — see there.
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
@@ -26,7 +29,9 @@ frozenlist==1.8.0
 fsspec==2026.4.0
 google==3.0.0
 google-api-core==2.30.0
+google-api-python-client==2.201.0
 google-auth==2.49.1
+google-auth-httplib2==0.4.4
 google-cloud-aiplatform==1.141.0
 google-cloud-core==2.5.0
 google-cloud-resource-manager==1.16.0
@@ -36,6 +41,7 @@ google-genai==1.68.0
 google-resumable-media==2.8.0
 googleapis-common-protos==1.73.0
 grpc-google-iam-v1==0.14.3
+httplib2==0.32.0
 grpcio==1.78.0
 grpcio-status==1.78.0
 h11==0.16.0
@@ -92,6 +98,7 @@ typer==0.25.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzlocal==5.3.1
+uritemplate==4.2.0
 urllib3==2.6.3
 uvicorn==0.46.0
 websockets==15.0.1

@@ -442,3 +442,50 @@ async def upsert_google_credentials(user_id: str, refresh_token: str, scopes: st
             log.warning("upsert_google_credentials failed for user=%s", user_id)
             return False
     return await _run(_)
+
+
+async def delete_google_credentials(user_id: str) -> bool:
+    """Remove a user's stored Google refresh token (G3 disconnect). Returns
+    True on success, False on any DB error — never raises. The caller
+    (POST /calendar/disconnect) is responsible for best-effort revoking the
+    token with Google BEFORE calling this — once this row is gone, there's
+    no way to revoke it anymore."""
+    def _():
+        try:
+            _sb().table("google_calendar_credentials").delete().eq("user_id", user_id).execute()
+            return True
+        except Exception:
+            log.warning("delete_google_credentials failed for user=%s", user_id)
+            return False
+    return await _run(_)
+
+
+async def fetch_google_connection(user_id: str) -> dict:
+    """Connection STATUS only — {"connected": bool, "scopes": str|None,
+    "connected_at": str|None}. Deliberately selects ONLY scopes,
+    connected_at: this function must be structurally incapable of leaking
+    refresh_token, since its result is exposed directly to the client via
+    GET /calendar/connection_status. Never raises; {"connected": False,
+    "scopes": None, "connected_at": None} on any DB error — a status-check
+    failure must read as "not connected", never silently as "connected"
+    with stale/empty fields."""
+    def _():
+        try:
+            rows = (
+                _sb().table("google_calendar_credentials")
+                .select("scopes, connected_at")
+                .eq("user_id", user_id)
+                .execute()
+                .data
+            )
+            if not rows:
+                return {"connected": False, "scopes": None, "connected_at": None}
+            return {
+                "connected": True,
+                "scopes": rows[0].get("scopes"),
+                "connected_at": rows[0].get("connected_at"),
+            }
+        except Exception:
+            log.warning("fetch_google_connection failed for user=%s", user_id)
+            return {"connected": False, "scopes": None, "connected_at": None}
+    return await _run(_)

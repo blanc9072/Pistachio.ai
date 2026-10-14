@@ -1,0 +1,12 @@
+# macOS-only extras — install alongside requirements.txt ONLY on a Mac:
+#   pip install -r requirements.txt -r requirements-macos.txt
+#
+# pyobjc-framework-EventKit backs core/calendar_read_ek.py's EventKit read
+# path (CALENDAR_BACKEND=eventkit). It is NOT importable on Linux, which is
+# why it lives here rather than in requirements.txt — the Phase 2 VPS runs
+# CALENDAR_BACKEND=google and never imports EventKit at all (the module's
+# own imports are lazy — see calendar_read_ek.py's module docstring — so
+# its absence here doesn't even need to be caught, just not required).
+pyobjc-core==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-EventKit==12.2.2

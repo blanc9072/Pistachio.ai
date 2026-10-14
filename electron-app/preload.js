@@ -1,6 +1,12 @@
 const { contextBridge, ipcRenderer } = require('electron');
+const { WS_BASE } = require('./config');
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  // Voice relay base URL (ws://localhost:8765 local dev, wss://<DOMAIN>/ws
+  // once cloud-deployed — see config.js). A plain value, not an IPC call:
+  // config.js is static, read once at preload time.
+  voiceWsUrl: WS_BASE,
+
   // ── Model window ──────────────────────────────────────────────────────────
   onMouseMove:     (cb)     => ipcRenderer.on('mouse-move', (_, pos) => cb(pos)),
   setIgnoreMouse:  (ignore) => ipcRenderer.send('set-ignore-mouse', ignore),
@@ -24,9 +30,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   transcribe:   (audioB64)        => ipcRenderer.invoke('api:transcribe', audioB64),
   nudge:        (payload)         => ipcRenderer.invoke('api:nudge',      payload),
   onNudge:      (cb)              => ipcRenderer.on('nudge', (_, data) => cb(data)),
-  deleteByUid:  (uid, calendar)   => ipcRenderer.invoke('api:deleteByUid', { uid, calendar }),
-  moveByUid:    (uid, calendar, newStart, newEnd) =>
-                  ipcRenderer.invoke('api:moveByUid', { uid, calendar, newStart, newEnd }),
+  googleConnectStart:     () => ipcRenderer.invoke('api:googleConnectStart'),
+  googleConnectionStatus: () => ipcRenderer.invoke('api:googleConnectionStatus'),
+  googleDisconnect:       () => ipcRenderer.invoke('api:googleDisconnect'),
+  deleteByUid:  (uid, calendar, scope)   => ipcRenderer.invoke('api:deleteByUid', { uid, calendar, scope }),
+  moveByUid:    (uid, calendar, newStart, newEnd, scope) =>
+                  ipcRenderer.invoke('api:moveByUid', { uid, calendar, newStart, newEnd, scope }),
   addSlots:     (activity, slots, prefDelta) =>
                   ipcRenderer.invoke('api:addSlots', { activity, slots, prefDelta }),
   correctPlan:  (payload)          => ipcRenderer.invoke('api:correctPlan', payload),

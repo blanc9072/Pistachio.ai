@@ -3,12 +3,17 @@ import logging
 import base64
 import os
 import re
+import secrets
 import tempfile
+import time
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
+import httpx
 from faster_whisper import WhisperModel
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from supabase import create_client, Client as SupabaseClient
 from google.genai import types
@@ -16,12 +21,10 @@ from core.gemini import gemini_client, GEMINI_MODEL, generate_reply, SAFETY_SETT
 from core.memory import get_session
 from core.prompts import build_dynamic_prompt
 from core.tool_resolver import resolve_calendar_action
-from core.calendar_executor import (
-    create_calendar_event, delete_event, delete_by_uid, move_event, move_by_uid,
-    _resolve_list_date, _parse_dt,
-)
+from core.calendar_executor import _resolve_list_date, _parse_dt   # pure parsing helpers only
 from core.scheduler import infer_block, place_slots
-import core.calendar_read_ek as ek_read
+import core.calendar_backend as calendar_backend
+import core.calendar_google as calendar_google
 import core.db as db
 import core.tts as tts
 
@@ -185,6 +188,11 @@ class ChatResponse(BaseModel):
 class DeleteByUidRequest(BaseModel):
     uid:      str
     calendar: str
+    # G4: None (default) = ask-don't-act on a recurring target; "instance"
+    # or "series" once the client has asked "this one or all?" and the
+    # user answered. Google-only — eventkit ignores this and still
+    # refuses recurring events outright.
+    scope:    str | None = None
 
 
 class MoveByUidRequest(BaseModel):
@@ -192,6 +200,7 @@ class MoveByUidRequest(BaseModel):
     calendar:  str
     new_start: str
     new_end:   str | None = None
+    scope:     str | None = None
 
 
 class SlotIn(BaseModel):
@@ -377,26 +386,24 @@ async def transcribe_audio(
 # separate EventKit read, fresh on that later turn) are redirected here.
 # ---------------------------------------------------------------------------
 
-_EK_PERMISSION_MESSAGE = (
-    "I need Calendar access — grant Full Calendar access in "
-    "System Settings › Privacy & Security › Calendars."
-)
+async def _list_events_from_ek(user_id: str, args: dict, enabled: bool) -> dict:
+    """The DISPLAY read (list_events' single-day AND range paths), via
+    calendar_backend (G2b-2) — backend-agnostic, EventKit or Google
+    depending on CALENDAR_BACKEND. Mirrors calendar_executor.list_events's
+    exact single-day-vs-range argument contract (reusing its OWN pure
+    parsing helpers, _resolve_list_date/_parse_dt), so the resolver's args
+    work identically regardless of which read backend serves them.
+    writable_only=False — read-only calendars (a subscribed holidays
+    calendar, Birthdays) are real and visible here, same invariant
+    list_events() itself documents.
 
-
-async def _list_events_from_ek(args: dict, enabled: bool) -> dict:
-    """EK1: the DISPLAY read (list_events' single-day AND range paths),
-    now via EventKit instead of osascript. Mirrors calendar_executor.
-    list_events's exact single-day-vs-range argument contract (reusing
-    its OWN pure parsing helpers, _resolve_list_date/_parse_dt), so the
-    resolver's args work identically regardless of which read backend
-    serves them. writable_only=False — read-only calendars (a subscribed
-    holidays calendar, Birthdays) are real and visible here, same
-    invariant list_events() itself documents.
-
-    Never raises. A permission miss (EventKit access not fullAccess) is
-    surfaced as status="needs_permission" with a distinct message, never
-    a bare empty "success" — see calendar_read_ek.read_window's docstring
-    for why that distinction is load-bearing.
+    Never raises. A setup miss (EventKit permission, or Google not
+    connected) is surfaced as status="needs_permission" with a
+    backend-correct message (calendar_backend.setup_message()), never a
+    bare empty "success" — see calendar_backend.read_window's docstring
+    for why that distinction is load-bearing. The CLIENT-facing status
+    stays "needs_permission" either way (unchanged chat.html styling);
+    only the message text is backend-honest.
     """
     window_start_str = (args.get("window_start") or "").strip()
     window_end_str = (args.get("window_end") or "").strip()
@@ -417,11 +424,11 @@ async def _list_events_from_ek(args: dict, enabled: bool) -> dict:
 
         range_start = start_dt
         range_end = end_dt.replace(hour=23, minute=59, second=59)
-        read = await ek_read.read_window(range_start, range_end, writable_only=False)
-        if read["status"] == "needs_permission":
+        read = await calendar_backend.read_window(user_id, range_start, range_end, writable_only=False)
+        if read["status"] == "needs_setup":
             return {"status": "needs_permission", "kind": "list", "events": [],
                     "window_start": window_start_iso, "window_end": window_end_iso,
-                    "message": _EK_PERMISSION_MESSAGE}
+                    "message": read.get("message") or calendar_backend.setup_message()}
         if read["status"] != "ok":
             return {"status": "error", "kind": "list", "events": [],
                     "window_start": window_start_iso, "window_end": window_end_iso,
@@ -439,10 +446,10 @@ async def _list_events_from_ek(args: dict, enabled: bool) -> dict:
 
     start_dt = target
     end_dt = target.replace(hour=23, minute=59, second=59)
-    read = await ek_read.read_window(start_dt, end_dt, writable_only=False)
-    if read["status"] == "needs_permission":
+    read = await calendar_backend.read_window(user_id, start_dt, end_dt, writable_only=False)
+    if read["status"] == "needs_setup":
         return {"status": "needs_permission", "kind": "list", "events": [],
-                "date": date_iso, "message": _EK_PERMISSION_MESSAGE}
+                "date": date_iso, "message": read.get("message") or calendar_backend.setup_message()}
     if read["status"] != "ok":
         return {"status": "error", "kind": "list", "events": [],
                 "date": date_iso, "message": "Couldn't read the calendar."}
@@ -450,26 +457,26 @@ async def _list_events_from_ek(args: dict, enabled: bool) -> dict:
 
 
 async def _ek_busy_events(
-    start_dt: datetime, end_dt: datetime, writable_only: bool,
+    user_id: str, start_dt: datetime, end_dt: datetime, writable_only: bool,
 ) -> tuple[str, list[dict]]:
-    """The scheduler's PROPOSE-step busy-set, read live via EventKit (EK1)
-    instead of a live osascript list_events_window() scan or the (now
-    orphaned) snapshot cache. Returns (status, busy): status is
-    "ok" | "needs_permission" | "error". `busy` is the exact
-    {"start": datetime, "end": datetime} shape place_slots already
-    expects.
+    """The scheduler's PROPOSE-step busy-set, read live via
+    calendar_backend (G2b-2) instead of a live osascript
+    list_events_window() scan or the (now orphaned) snapshot cache.
+    Returns (status, busy): status is "ok" | "needs_setup" | "error".
+    `busy` is the exact {"start": datetime, "end": datetime} shape
+    place_slots already expects.
 
     writable_only mirrors list_events_window's own contract exactly: True
     for the scheduler (only calendars she can act on matter for
     placement) — this function is never called with False.
 
     NOTE: this is PROPOSE only. The pre-create RE-VERIFY in
-    calendar_add_slots below is its OWN separate EventKit read, taken
-    fresh on that turn — that re-verify is the entire safety story that
-    makes proposing here safe even against a just-changed calendar; it is
-    not touched or weakened by this function.
+    calendar_add_slots below is its OWN separate read, taken fresh on
+    that turn — that re-verify is the entire safety story that makes
+    proposing here safe even against a just-changed calendar; it is not
+    touched or weakened by this function.
     """
-    read = await ek_read.read_window(start_dt, end_dt, writable_only=writable_only)
+    read = await calendar_backend.read_window(user_id, start_dt, end_dt, writable_only)
     if read["status"] != "ok":
         return read["status"], []
 
@@ -522,25 +529,25 @@ def _plan_result(status: str, activity: str, **extra) -> dict:
 
 
 async def _place_plan(
-    activity: str, block: dict, window_start: datetime, window_end: datetime,
+    user_id: str, activity: str, block: dict, window_start: datetime, window_end: datetime,
     count: int, tod_pref: str | None, day_exclusions: set,
 ) -> dict:
     """The shared placement TAIL of the scheduler pipeline: the PROPOSE
-    step's busy-set read (live via EventKit — EK1, fast, no contention,
-    no cache-staleness question) + place_slots, given an already-computed
-    `block` dict. Used by BOTH _suggest_slots_plan (the original
-    proposal, block from infer_block) and the correction re-plan in
-    calendar_correct_plan (block re-inferred with a corrected override)
+    step's busy-set read (live via calendar_backend — G2b-2, fast, no
+    contention, no cache-staleness question) + place_slots, given an
+    already-computed `block` dict. Used by BOTH _suggest_slots_plan (the
+    original proposal, block from infer_block) and the correction re-plan
+    in calendar_correct_plan (block re-inferred with a corrected override)
     — the only thing that differs between the two callers is how `block`
     was produced; the placement logic itself is identical and lives here
     exactly once, so the placer/re-verify behavior can't drift between
     the two paths.
 
     IMPORTANT: this is PROPOSE only. calendar_add_slots' pre-create
-    RE-VERIFY takes its OWN separate EventKit read, fresh on that later
-    turn — proposing here and re-verifying there are deliberately two
-    separate reads, since time passes (and something could change)
-    between a proposal and the user's yes.
+    RE-VERIFY takes its OWN separate read, fresh on that later turn —
+    proposing here and re-verifying there are deliberately two separate
+    reads, since time passes (and something could change) between a
+    proposal and the user's yes.
 
     Never raises. The returned dict carries window_start/window_end/
     day_exclusions/requested back out (as plain ISO strings) so a client
@@ -549,9 +556,9 @@ async def _place_plan(
     original request's window.
     """
     range_end = window_end.replace(hour=23, minute=59, second=59)
-    busy_status, busy = await _ek_busy_events(window_start, range_end, writable_only=True)
-    if busy_status == "needs_permission":
-        return _plan_result("needs_permission", activity, message=_EK_PERMISSION_MESSAGE)
+    busy_status, busy = await _ek_busy_events(user_id, window_start, range_end, writable_only=True)
+    if busy_status == "needs_setup":
+        return _plan_result("needs_permission", activity, message=calendar_backend.setup_message())
     if busy_status != "ok":
         return _plan_result("error", activity, message="Couldn't read the calendar.")
 
@@ -654,7 +661,7 @@ async def _suggest_slots_plan(args: dict, user_id: str) -> dict:
     effective_tod_pref = requested_tod_pref or block.get("tod_pref")
 
     return await _place_plan(
-        activity, block, window_start, window_end, count, effective_tod_pref, day_exclusions,
+        user_id, activity, block, window_start, window_end, count, effective_tod_pref, day_exclusions,
     )
 
 
@@ -907,17 +914,24 @@ async def chat(
                     action_key = _CALENDAR_TOOL_PERMISSIONS.get(resolved.tool)
                     cal_enabled = perms["master"] and perms.get(action_key, False)
                     if resolved.tool == "create_event":
-                        calendar_action = await create_calendar_event(resolved.args, enabled=cal_enabled)
+                        calendar_action = await calendar_backend.create_event(
+                            user_id, resolved.args, cal_enabled,
+                        )
                     elif resolved.tool == "list_events":
-                        # EK1: the display read now hits EventKit directly,
-                        # live — see the "Calendar reads" section above.
+                        # G2b-2: the display read goes through the backend
+                        # seam — EventKit or Google per CALENDAR_BACKEND —
+                        # see the "Calendar reads" section above.
                         calendar_action = await _list_events_from_ek(
-                            resolved.args, enabled=cal_enabled,
+                            user_id, resolved.args, enabled=cal_enabled,
                         )
                     elif resolved.tool == "move_event":
-                        calendar_action = await move_event(resolved.args, enabled=cal_enabled)
+                        calendar_action = await calendar_backend.move_event(
+                            user_id, resolved.args, cal_enabled,
+                        )
                     else:
-                        calendar_action = await delete_event(resolved.args, enabled=cal_enabled)
+                        calendar_action = await calendar_backend.delete_event(
+                            user_id, resolved.args, cal_enabled,
+                        )
                     log.info("[stage3] execution result (tool=%s calendar_enabled=%s): %s",
                              resolved.tool, cal_enabled, calendar_action)
                 elif resolved.status == "resolved" and resolved.tool == "suggest_slots":
@@ -969,6 +983,181 @@ async def chat(
         )
 
 
+# ---------------------------------------------------------------------------
+# Google Calendar connection (G3) — the in-app "Connect Google Calendar"
+# OAuth consent flow that writes the refresh token the calendar_backend
+# seam already reads (db.fetch_google_refresh_token ->
+# calendar_google.credentials_for_token). Does NOT touch calendar I/O,
+# calendar_backend, calendar_google's read/write functions, or any
+# permission gate — purely the connect/disconnect/status surface.
+#
+# System browser only: Google refuses OAuth inside an embedded webview/
+# BrowserWindow (fails with disallowed_useragent) — consent MUST open via
+# Electron's shell.openExternal into the user's real browser. The backend
+# hosts the redirect callback (GOOGLE_OAUTH_REDIRECT_URI), which is why
+# /oauth/google/callback below is NOT bearer-authenticated: it's a browser
+# redirect target, not an API call from the Electron client, so it can't
+# carry an Authorization header. It's secured by the one-time `state`
+# token instead (CSRF guard, and the only way the callback learns WHICH
+# user to store the credential for).
+#
+# The refresh token never leaves the backend: it's written straight to
+# the service-role-only google_calendar_credentials table and is never
+# included in a redirect, a query string, a log line, or a response body
+# — see db.fetch_google_connection's own docstring for the same
+# invariant on the read side.
+# ---------------------------------------------------------------------------
+
+# state -> (user_id, created_epoch). One backend process today, so an
+# in-memory dict is fine; a multi-instance cloud deploy would need a
+# short-TTL table or Redis instead (noted, not built now).
+_OAUTH_STATES: dict[str, tuple[str, float]] = {}
+_OAUTH_STATE_TTL = 600  # 10 min
+
+
+def _prune_oauth_states() -> None:
+    now = time.time()
+    expired = [s for s, (_, created) in _OAUTH_STATES.items() if now - created > _OAUTH_STATE_TTL]
+    for s in expired:
+        del _OAUTH_STATES[s]
+
+
+def _oauth_html(message: str, ok: bool) -> HTMLResponse:
+    """Minimal, self-contained callback page — no template engine, no
+    external assets. `ok` only affects styling/status code; the backend
+    NEVER puts the refresh token (or anything from the token exchange)
+    into this page."""
+    color = "#1a7f37" if ok else "#c0392b"
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Pistachio — Google Calendar</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; background: #f7f7f5;
+          display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+  .card {{ background: #fff; border-radius: 12px; padding: 32px 40px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            text-align: center; max-width: 360px; }}
+  p {{ color: {color}; font-size: 15px; margin: 0; }}
+</style></head>
+<body><div class="card"><p>{message}</p></div></body></html>"""
+    return HTMLResponse(content=html, status_code=200 if ok else 400)
+
+
+@app.get("/oauth/google/start")
+async def oauth_google_start(user_id: str = Depends(get_current_user)):
+    """Builds the Google consent URL for this user and hands it back as
+    JSON — the Electron client opens it via shell.openExternal (the
+    system browser), never an in-app window. access_type=offline +
+    prompt=consent together are what GUARANTEE a refresh_token comes back
+    on this (and every) consent, not just the first ever grant for this
+    app — without prompt=consent, a user who'd previously connected (even
+    on a different device) could get a code-exchange response with NO
+    refresh_token at all.
+    """
+    _prune_oauth_states()
+    state = secrets.token_urlsafe(32)
+    _OAUTH_STATES[state] = (user_id, time.time())
+
+    redirect_uri = os.environ["GOOGLE_OAUTH_REDIRECT_URI"]
+    params = {
+        "client_id": os.environ["GOOGLE_OAUTH_CLIENT_ID"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(calendar_google._SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+        "state": state,
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return {"url": url}
+
+
+@app.get("/oauth/google/callback")
+async def oauth_google_callback(code: str | None = None, state: str | None = None, error: str | None = None):
+    """The browser lands here after the user accepts/declines Google's
+    consent screen. NOT bearer-authenticated (see module comment above) —
+    `state` is both the CSRF guard and how we learn which user this
+    consent belongs to. Never 500s to the browser: every failure path
+    returns a plain HTML page explaining the user should try again.
+    """
+    if error:
+        log.info("[oauth] google consent returned error=%s", error)
+        return _oauth_html("Didn't connect — you can close this tab and try again in Pistachio.", ok=False)
+
+    _prune_oauth_states()
+    if not code or not state or state not in _OAUTH_STATES:
+        log.warning("[oauth] google callback with missing/unknown/expired state")
+        return _oauth_html("That link expired or isn't valid — try connecting again from Pistachio.", ok=False)
+
+    user_id, _created = _OAUTH_STATES.pop(state)
+
+    redirect_uri = os.environ["GOOGLE_OAUTH_REDIRECT_URI"]
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                calendar_google._TOKEN_URI,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": os.environ["GOOGLE_OAUTH_CLIENT_ID"],
+                    "client_secret": os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
+                    "redirect_uri": redirect_uri,
+                },
+            )
+            payload = resp.json()
+    except Exception as exc:
+        log.error("[oauth] token exchange request failed: %s", exc)
+        return _oauth_html("Couldn't reach Google to finish connecting — try again.", ok=False)
+
+    if resp.status_code >= 400:
+        log.warning("[oauth] token exchange failed status=%d body_keys=%s", resp.status_code, list(payload.keys()))
+        return _oauth_html("Google didn't confirm the connection — try again.", ok=False)
+
+    refresh_token = payload.get("refresh_token")
+    if not refresh_token:
+        # Shouldn't happen with access_type=offline + prompt=consent, but
+        # never store a row with no refresh token — that would silently
+        # report "connected" for a credential that can't actually be used.
+        log.warning("[oauth] token exchange succeeded but no refresh_token present for user=%s", user_id)
+        return _oauth_html("Connected, but Google didn't send a long-lived credential — try again.", ok=False)
+
+    ok = await db.upsert_google_credentials(user_id, refresh_token, " ".join(calendar_google._SCOPES))
+    if not ok:
+        return _oauth_html("Connected to Google, but couldn't save it — try again.", ok=False)
+
+    log.info("[oauth] google calendar connected for user=%s", user_id)
+    return _oauth_html("✓ Google Calendar connected — you can close this tab and return to Pistachio.", ok=True)
+
+
+@app.get("/calendar/connection_status")
+async def calendar_connection_status(user_id: str = Depends(get_current_user)):
+    """{"connected": bool, "scopes": str|None, "connected_at": str|None}
+    — never the refresh token itself; see db.fetch_google_connection's
+    docstring for why that function is structurally incapable of
+    returning it."""
+    return await db.fetch_google_connection(user_id)
+
+
+@app.post("/calendar/disconnect")
+async def calendar_disconnect(user_id: str = Depends(get_current_user)):
+    """Best-effort revoke with Google, then delete the stored row. Revoke
+    failures are swallowed (logged only) — the row is deleted regardless,
+    since from Pistachio's side "disconnected" just means "we don't have
+    a usable token anymore," independent of whether Google's own revoke
+    endpoint happened to succeed this time.
+    """
+    token = await db.fetch_google_refresh_token(user_id)
+    if token:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.post("https://oauth2.googleapis.com/revoke", params={"token": token})
+        except Exception as exc:
+            log.warning("[oauth] revoke call failed for user=%s (disconnecting anyway): %s", user_id, exc)
+
+    await db.delete_google_credentials(user_id)
+    log.info("[oauth] google calendar disconnected for user=%s", user_id)
+    return {"status": "disconnected"}
+
+
 @app.post("/calendar/delete_by_uid")
 async def calendar_delete_by_uid(
     req: DeleteByUidRequest,
@@ -988,9 +1177,9 @@ async def calendar_delete_by_uid(
     """
     perms = await db.fetch_calendar_permissions(user_id)
     enabled = perms["master"] and perms.get("delete", False)
-    result = await delete_by_uid(req.uid, req.calendar, enabled=enabled)
-    log.info("[calendar] delete_by_uid uid=%s calendar=%r enabled=%s -> %s",
-             req.uid, req.calendar, enabled, result)
+    result = await calendar_backend.delete_by_uid(user_id, req.uid, req.calendar, enabled, scope=req.scope)
+    log.info("[calendar] delete_by_uid uid=%s calendar=%r enabled=%s scope=%r -> %s",
+             req.uid, req.calendar, enabled, req.scope, result)
     return result
 
 
@@ -1014,9 +1203,9 @@ async def calendar_move_by_uid(
     """
     perms = await db.fetch_calendar_permissions(user_id)
     enabled = perms["master"] and perms.get("move", False)
-    result = await move_by_uid(req.uid, req.calendar, req.new_start, req.new_end, enabled=enabled)
-    log.info("[calendar] move_by_uid uid=%s calendar=%r new_start=%r enabled=%s -> %s",
-             req.uid, req.calendar, req.new_start, enabled, result)
+    result = await calendar_backend.move_by_uid(user_id, req.uid, req.calendar, req.new_start, req.new_end, enabled, scope=req.scope)
+    log.info("[calendar] move_by_uid uid=%s calendar=%r new_start=%r enabled=%s scope=%r -> %s",
+             req.uid, req.calendar, req.new_start, enabled, req.scope, result)
     return result
 
 
@@ -1035,13 +1224,13 @@ async def calendar_add_slots(
     batch equivalent of delete/move's staleness re-verify: time has
     passed since the proposal was built (however the user's yes took to
     arrive), and something else could have filled a proposed slot since.
-    A fresh EventKit read (EK1 — core.calendar_read_ek, expands recurring
+    A fresh read via calendar_backend (G2b-2 — expands recurring
     occurrences, so a recurring class landing in a proposed slot is
     caught here too) covering every proposed slot is taken HERE, on this
     turn, and any slot that now conflicts is skipped rather than
-    clobbered — create_calendar_event is only ever called on slots
-    confirmed still free by this fresh read, never on the stale slots
-    the client sent.
+    clobbered — the create call is only ever made on slots confirmed
+    still free by this fresh read, never on the stale slots the client
+    sent.
     """
     perms = await db.fetch_calendar_permissions(user_id)
     enabled = perms["master"] and perms.get("create", False)
@@ -1068,11 +1257,11 @@ async def calendar_add_slots(
 
     window_start = min(s for s, _ in parsed_slots)
     window_end = max(e for _, e in parsed_slots)
-    fresh = await ek_read.read_window(window_start, window_end, writable_only=True)
-    if fresh["status"] == "needs_permission":
+    fresh = await calendar_backend.read_window(user_id, window_start, window_end, writable_only=True)
+    if fresh["status"] == "needs_setup":
         return {
             "status": "needs_permission", "kind": "plan_added",
-            "message": _EK_PERMISSION_MESSAGE,
+            "message": fresh.get("message") or calendar_backend.setup_message(),
             "added": [], "skipped": [],
         }
     if fresh["status"] != "ok":
@@ -1101,8 +1290,8 @@ async def calendar_add_slots(
         if _conflicts(start, end):
             skipped.append(slot_out)
             continue
-        result = await create_calendar_event(
-            {"title": activity, "start": start.isoformat(), "end": end.isoformat()}, enabled=enabled,
+        result = await calendar_backend.create_event(
+            user_id, {"title": activity, "start": start.isoformat(), "end": end.isoformat()}, enabled,
         )
         if result.get("status") == "success":
             added.append(slot_out)
@@ -1208,7 +1397,7 @@ async def calendar_correct_plan(
     effective_tod_pref = corrected_pref.get("tod_pref") or block.get("tod_pref")
 
     plan = await _place_plan(
-        req.activity, block, window_start, window_end, req.count, effective_tod_pref, day_exclusions,
+        user_id, req.activity, block, window_start, window_end, req.count, effective_tod_pref, day_exclusions,
     )
     plan["echo"] = echo
     # The delta (numeric fields only) rides along so the client can STAGE

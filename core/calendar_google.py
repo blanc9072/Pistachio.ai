@@ -54,12 +54,19 @@ WRITE SURFACE (this half, built on the G1 probe's write findings):
     iCloud calendar osascript's `first calendar whose writable is true`
     happened to pick. A per-user default-target-calendar preference is a
     follow-on (needs a settings picker); "primary" is the default now.
-  - RECURRENCE REFUSAL is kept for parity with calendar_executor — move/
-    delete both refuse when the target is part of a series (detected via
-    recurringEventId on an instance, or a recurrence rule on a master).
-    The probe proved single-instance editing works cleanly; lifting this
-    refusal to use it is G4's deliberate, separate decision, not this
-    one's.
+  - RECURRENCE (G4): move/delete detect a recurring target (recurringEventId
+    on an instance, or a recurrence rule on a master) via _is_recurring()
+    and, when the caller hasn't already picked a `scope`, return
+    "recurring_choice" rather than acting — the client asks "just this
+    one, or the whole series?" and re-calls with scope="instance"|"series".
+    An instance scope patches/deletes the occurrence's own id; a series
+    scope targets the master (recurringEventId), with delete confirmed
+    via _confirm_series_gone_sync (events().instances(), not a single-id
+    check) and move shifting the master's time-of-day on its own anchor
+    date (never relocating the series to the user's occurrence date).
+    THE OSASCRIPT/EVENTKIT PATH IS UNCHANGED — it still refuses recurring
+    events outright; this instance-vs-series handling is Google-only,
+    since osascript has no safe way to address a single occurrence.
   - SNAG #4 — DELETE CONFIRMATION: events.delete leaves the event
     retrievable by GET for a while afterward with status:"cancelled" —
     that is NOT "still there". The only honest "is it really gone" check
@@ -113,6 +120,17 @@ def _build_credentials(refresh_token: str) -> Credentials:
         client_secret=os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
         scopes=_SCOPES,
     )
+
+
+def credentials_for_token(refresh_token: str | None) -> Credentials | None:
+    """Public entry point for turning a stored token into creds: returns
+    None directly when there's no token (e.g. db.fetch_google_refresh_
+    token came back empty), so callers don't need their own `if token:
+    ... else None` branch — every function in this module already treats
+    creds=None uniformly as "not connected". Thin wrapper over
+    _build_credentials, which stays private since it assumes a non-None
+    token."""
+    return _build_credentials(refresh_token) if refresh_token else None
 
 
 async def _run(fn):
@@ -310,8 +328,9 @@ async def read_window(
 # osascript executor's by construction, not by careful copying.
 # ---------------------------------------------------------------------------
 
-_RECURRING_MOVE_MSG = "I can't move repeating events yet — change it in the Calendar app directly"
-_RECURRING_DELETE_MSG = "I can't delete repeating events yet — remove it in the Calendar app directly"
+_RECURRING_SERIES_ALLDAY_MOVE_MSG = (
+    "To reschedule a repeating all-day event, change it in Google Calendar directly"
+)
 
 
 def _get_event_sync(creds: Credentials | None, calendar_id: str, event_id: str) -> tuple[str, dict]:
@@ -422,6 +441,35 @@ def _confirm_gone_sync(
         return event_id not in ids
     except Exception as exc:
         log.warning("[google-write] confirm-gone check failed for uid=%s, assuming NOT confirmed: %s", event_id, exc)
+        return False
+
+
+def _confirm_series_gone_sync(creds: Credentials, calendar_id: str, master_id: str) -> bool:
+    """SNAG #4, series edition (G4): after deleting a WHOLE recurring
+    series via its master id, a single id's absence isn't the right
+    check — any surviving occurrence would appear under its OWN instance
+    id (recurringEventId == master_id), not the master's id. Uses
+    events().instances() — the dedicated Google endpoint for a series'
+    occurrences — rather than scanning a date window: a deleted master
+    either 404s/410s there (caught as HttpError, treated as confirmed
+    gone) or returns occurrences we check aren't all cancelled already.
+    Fails safe toward "not confirmed" on any other exception — never
+    report a series delete as successful on a guess."""
+    try:
+        service = _build_service("calendar", "v3", credentials=creds)
+        resp = service.events().instances(calendarId=calendar_id, eventId=master_id).execute()
+        remaining = [i for i in resp.get("items", []) if i.get("status") != "cancelled"]
+        return len(remaining) == 0
+    except HttpError as exc:
+        if exc.resp.status in (404, 410):
+            return True  # the master itself is gone -- the series is confirmed gone
+        log.warning(
+            "[google-write] confirm-series-gone instances() failed status=%s for master=%s, assuming NOT confirmed: %s",
+            exc.resp.status, master_id, exc,
+        )
+        return False
+    except Exception as exc:
+        log.warning("[google-write] confirm-series-gone check failed for master=%s, assuming NOT confirmed: %s", master_id, exc)
         return False
 
 
@@ -554,14 +602,31 @@ async def create_event(args: dict, enabled: bool, creds: Credentials | None, cal
 
 
 async def move_by_uid(
-    uid: str, calendar: str, new_start: str, new_end: str | None, enabled: bool, creds: Credentials | None,
+    uid: str, calendar: str, new_start: str, new_end: str | None, enabled: bool,
+    creds: Credentials | None, scope: str | None = None,
 ) -> dict:
     """The guarded single-event move — app_disabled/needs_connection gate,
-    recurrence refusal, re-verify, duration-preserving new_end
+    recurrence handling, re-verify, duration-preserving new_end
     computation, the write, and a SEPARATE confirm read-back (never
     trusting patch's own echoed response) — same guard order as
     calendar_executor.move_by_uid, same result shape (_move_result,
-    reused directly). Never raises."""
+    reused directly). Never raises.
+
+    RECURRENCE (G4, Google-only — the osascript/eventkit path still
+    refuses outright): `scope` is None | "instance" | "series".
+      - scope=None on a recurring target: does NOT act. Returns
+        status="recurring_choice" carrying the occurrence as a candidate
+        plus the pending new_start/new_end, for the client to re-call
+        with an explicit scope once the user picks.
+      - scope="instance": patches the INSTANCE id (`uid`) — Google
+        records this as a per-occurrence exception; the instance id
+        persists, so the confirm read-back below still works unchanged.
+      - scope="series": patches the SERIES MASTER (`recurringEventId`),
+        shifting its TIME-OF-DAY onto the master's own anchor date — NEVER
+        relocating the series to the user's occurrence date. All-day
+        series moves are explicitly out of scope (instance-level all-day
+        move is fine; see _RECURRING_SERIES_ALLDAY_MOVE_MSG).
+    """
     if not enabled:
         return _move_result("app_disabled", "Calendar actions are turned off.")
     if creds is None:
@@ -583,33 +648,72 @@ async def move_by_uid(
 
         title = ev.get("summary") or ""
         orig_start_val, is_all_day = _parsed_start_end(ev.get("start", {}))
+        orig_end_val, _ = _parsed_start_end(ev.get("end", {}))
+        recurring = _is_recurring(ev)
 
-        # Fail-safe, same spirit as the osascript executor's recurrence
-        # guard: refuse rather than risk silently mutating a whole series.
-        if _is_recurring(ev):
-            log.info("[google-write] refusing recurring move for uid=%s title=%r", uid, title)
+        if recurring and scope is None:
+            log.info("[google-write] recurring move needs a scope choice for uid=%s title=%r", uid, title)
+            occurrence = {"uid": uid, "title": title, "start": orig_start_val,
+                          "end": orig_end_val, "calendar": calendar, "all_day": is_all_day}
             return _move_result(
-                "recurring_unsupported", _RECURRING_MOVE_MSG, title=title, start=orig_start_val,
+                "recurring_choice", title=title, start=orig_start_val,
+                candidates=[_to_candidate(occurrence)], approximate=False,
+                new_start=new_start, new_end=new_end,
             )
 
+        if recurring and scope == "series" and is_all_day:
+            return _move_result(
+                "recurring_unsupported", _RECURRING_SERIES_ALLDAY_MOVE_MSG, title=title, start=orig_start_val,
+            )
+
+        if recurring:
+            if scope not in ("instance", "series"):
+                return _move_result("error", "Couldn't tell which to move.")
+            target_id = uid if scope == "instance" else (ev.get("recurringEventId") or uid)
+        else:
+            target_id = uid
+
         # RE-VERIFY immediately before writing — closes the gap between
-        # the GET above and the write below (staleness guard).
-        status2, ev2 = await _get_event(creds, calendar, uid)
+        # the GET above and the write below (staleness guard). Targets
+        # whatever we're ABOUT TO WRITE (the instance, or the series
+        # master), not always the original uid.
+        status2, ev2 = await _get_event(creds, calendar, target_id)
         if status2 == "not_found":
             return _move_result("not_found", "that event's no longer there", title=title, start=orig_start_val)
         if status2 != "ok":
             return _move_result("error", "Couldn't verify that event.", title=title)
 
-        if new_end_dt is None:
-            orig_start_dt = _parse_dt(orig_start_val)
-            orig_end_val, _ = _parsed_start_end(ev.get("end", {}))
-            orig_end_dt = _parse_dt(orig_end_val)
-            if orig_start_dt is None or orig_end_dt is None:
-                return _move_result("error", "Couldn't read that event's current time.", title=title)
-            new_end_dt = new_start_dt + (orig_end_dt - orig_start_dt)
+        if recurring and scope == "series":
+            # SERIES MOVE — shift time-of-day onto the MASTER's own anchor
+            # date; never relocate the series to the user's occurrence
+            # date (that would silently move every future occurrence to a
+            # single day instead of recurring).
+            m_start_val, _ = _parsed_start_end(ev2.get("start", {}))
+            m_end_val, _ = _parsed_start_end(ev2.get("end", {}))
+            m_start_dt = _parse_dt(m_start_val)
+            m_end_dt = _parse_dt(m_end_val)
+            if m_start_dt is None or m_end_dt is None:
+                return _move_result("error", "Couldn't read the series' current time.", title=title)
+            new_write_start = m_start_dt.replace(
+                hour=new_start_dt.hour, minute=new_start_dt.minute, second=0, microsecond=0,
+            )
+            duration = (new_end_dt - new_start_dt) if new_end_dt is not None else (m_end_dt - m_start_dt)
+            new_write_end = new_write_start + duration
+        else:
+            new_write_start = new_start_dt
+            if new_end_dt is None:
+                orig_t_start_val, _ = _parsed_start_end(ev2.get("start", {}))
+                orig_t_end_val, _ = _parsed_start_end(ev2.get("end", {}))
+                orig_t_start_dt = _parse_dt(orig_t_start_val)
+                orig_t_end_dt = _parse_dt(orig_t_end_val)
+                if orig_t_start_dt is None or orig_t_end_dt is None:
+                    return _move_result("error", "Couldn't read that event's current time.", title=title)
+                new_write_end = new_start_dt + (orig_t_end_dt - orig_t_start_dt)
+            else:
+                new_write_end = new_end_dt
 
-        body = _event_body(new_start_dt, new_end_dt, is_all_day)
-        patch_status, _patched = await _patch_event(creds, calendar, uid, body)
+        body = _event_body(new_write_start, new_write_end, is_all_day)
+        patch_status, _patched = await _patch_event(creds, calendar, target_id, body)
         if patch_status == "not_found":
             return _move_result("not_found", "that event's no longer there", title=title, start=orig_start_val)
         if patch_status != "ok":
@@ -617,22 +721,23 @@ async def move_by_uid(
 
         # Confirm read-back — a SEPARATE get, never trusting patch's own
         # echoed response (same discipline as calendar_executor.move_by_uid).
-        confirm_status, confirm_ev = await _get_event(creds, calendar, uid)
+        # For a series move this confirms the MASTER's new time-of-day.
+        confirm_status, confirm_ev = await _get_event(creds, calendar, target_id)
         if confirm_status != "ok":
             return _move_result("error", "Couldn't confirm the move.", title=title)
         confirmed_start_val, _ = _parsed_start_end(confirm_ev.get("start", {}))
         confirmed_end_val, _ = _parsed_start_end(confirm_ev.get("end", {}))
-        if _parse_dt(confirmed_start_val) != new_start_dt or _parse_dt(confirmed_end_val) != new_end_dt:
+        if _parse_dt(confirmed_start_val) != new_write_start or _parse_dt(confirmed_end_val) != new_write_end:
             log.warning(
-                "[google-write] move did not confirm for uid=%s (intended %s-%s, actual %s-%s) — "
-                "reporting error, not success", uid, new_start_dt, new_end_dt, confirmed_start_val, confirmed_end_val,
+                "[google-write] move did not confirm for target=%s (intended %s-%s, actual %s-%s) — "
+                "reporting error, not success", target_id, new_write_start, new_write_end, confirmed_start_val, confirmed_end_val,
             )
             return _move_result("error", "couldn't confirm the move", title=title)
 
-        log.info("[google-write] moved event %r (uid=%s) to %s -> %s",
-                  title, uid, new_start_dt.isoformat(), new_end_dt.isoformat())
+        log.info("[google-write] moved event %r (target=%s, scope=%s) to %s -> %s",
+                  title, target_id, scope, new_write_start.isoformat(), new_write_end.isoformat())
         return _move_result(
-            "success", title=title, start=new_start_dt.isoformat(), end=new_end_dt.isoformat(), all_day=is_all_day,
+            "success", title=title, start=new_write_start.isoformat(), end=new_write_end.isoformat(), all_day=is_all_day,
         )
 
     except Exception as exc:
@@ -694,13 +799,29 @@ async def move_event(args: dict, enabled: bool, creds: Credentials | None) -> di
     )
 
 
-async def delete_by_uid(uid: str, calendar: str, enabled: bool, creds: Credentials | None) -> dict:
+async def delete_by_uid(
+    uid: str, calendar: str, enabled: bool, creds: Credentials | None, scope: str | None = None,
+) -> dict:
     """The guarded single-event delete — app_disabled/needs_connection
-    gate, recurrence refusal, re-verify, delete, and SNAG #4's
+    gate, recurrence handling, re-verify, delete, and SNAG #4's
     events.list-based confirmation (never a GET-by-id/recount — see
     _confirm_gone_sync) — same guard order as calendar_executor.
     delete_by_uid, same result shape (_delete_result, reused directly).
-    Never raises."""
+    Never raises.
+
+    RECURRENCE (G4, Google-only — the osascript/eventkit path still
+    refuses outright): `scope` is None | "instance" | "series".
+      - scope=None on a recurring target: does NOT act. Returns
+        status="recurring_choice" carrying the occurrence as a candidate
+        for the client to re-call with an explicit scope once the user
+        picks.
+      - scope="instance": deletes just the INSTANCE id (`uid`).
+      - scope="series": deletes the SERIES MASTER (`recurringEventId`),
+        confirmed gone via _confirm_series_gone_sync (events().instances()
+        on the master), not the single-id check — a series delete can
+        leave OTHER instance ids behind that a single-id absence check
+        would miss entirely.
+    """
     if not enabled:
         return _delete_result("app_disabled", "Calendar actions are turned off.")
     if creds is None:
@@ -717,39 +838,62 @@ async def delete_by_uid(uid: str, calendar: str, enabled: bool, creds: Credentia
 
         title = ev.get("summary") or ""
         start_val, _ = _parsed_start_end(ev.get("start", {}))
+        end_val, _ = _parsed_start_end(ev.get("end", {}))
+        all_day = bool(ev.get("start", {}).get("date"))
+        recurring = _is_recurring(ev)
 
-        if _is_recurring(ev):
-            log.info("[google-write] refusing recurring delete for uid=%s title=%r", uid, title)
-            return _delete_result("recurring_unsupported", _RECURRING_DELETE_MSG, title=title, start=start_val)
+        if recurring and scope is None:
+            log.info("[google-write] recurring delete needs a scope choice for uid=%s title=%r", uid, title)
+            occurrence = {"uid": uid, "title": title, "start": start_val,
+                          "end": end_val, "calendar": calendar, "all_day": all_day}
+            return _delete_result(
+                "recurring_choice", title=title, start=start_val,
+                candidates=[_to_candidate(occurrence)], approximate=False,
+            )
 
-        # RE-VERIFY immediately before deleting (staleness guard).
-        status2, _ev2 = await _get_event(creds, calendar, uid)
+        if recurring:
+            if scope not in ("instance", "series"):
+                return _delete_result("error", "Couldn't tell which to delete.")
+            target_id = uid if scope == "instance" else (ev.get("recurringEventId") or uid)
+        else:
+            target_id = uid
+
+        # RE-VERIFY immediately before deleting (staleness guard) — targets
+        # whatever we're ABOUT TO DELETE (the instance, or the series
+        # master), not always the original uid.
+        status2, ev2 = await _get_event(creds, calendar, target_id)
         if status2 == "not_found":
             return _delete_result("not_found", "that event's no longer there", title=title, start=start_val)
         if status2 != "ok":
             return _delete_result("error", "Couldn't verify that event.", title=title)
 
-        end_val, _ = _parsed_start_end(ev.get("end", {}))
-        start_dt = _parse_dt(start_val) or datetime.now()
-        end_dt = _parse_dt(end_val) or start_dt
+        t_start_val, _ = _parsed_start_end(ev2.get("start", {}))
+        t_end_val, _ = _parsed_start_end(ev2.get("end", {}))
+        t_start_dt = _parse_dt(t_start_val) or datetime.now()
+        t_end_dt = _parse_dt(t_end_val) or t_start_dt
 
-        del_status = await _delete_event_raw(creds, calendar, uid)
+        del_status = await _delete_event_raw(creds, calendar, target_id)
         if del_status == "not_found":
             return _delete_result("not_found", "that event's no longer there", title=title, start=start_val)
         if del_status != "ok":
             return _delete_result("error", "couldn't remove it", title=title, start=start_val)
 
-        # SNAG #4: confirm via events.list (list-exclusion), NOT a
-        # GET-by-id — a GET right after this can still return 200 with
-        # status:"cancelled" for a while, which is NOT "still there".
-        gone = await _run(lambda: _confirm_gone_sync(creds, calendar, uid, start_dt, end_dt))
+        # SNAG #4: confirm via events.list (list-exclusion) / instances()
+        # for a series — NEVER a GET-by-id — a GET right after this can
+        # still return 200 with status:"cancelled" for a while, which is
+        # NOT "still there".
+        if recurring and scope == "series":
+            gone = await _run(lambda: _confirm_series_gone_sync(creds, calendar, target_id))
+        else:
+            gone = await _run(lambda: _confirm_gone_sync(creds, calendar, target_id, t_start_dt, t_end_dt))
         if not gone:
             log.warning(
-                "[google-write] delete did not confirm removal for uid=%s — reporting error, not success", uid,
+                "[google-write] delete did not confirm removal for target=%s (scope=%s) — "
+                "reporting error, not success", target_id, scope,
             )
             return _delete_result("error", "couldn't remove it", title=title, start=start_val)
 
-        log.info("[google-write] deleted event %r (uid=%s) from calendar=%r", title, uid, calendar)
+        log.info("[google-write] deleted event %r (target=%s, scope=%s) from calendar=%r", title, target_id, scope, calendar)
         return _delete_result("success", title=title, start=start_val)
 
     except Exception as exc:

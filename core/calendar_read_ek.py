@@ -35,13 +35,22 @@ osascript's OWN uid space via calendar_executor._find_candidates, a
 completely separate namespace. Confirmed by inspection that the client only
 ever feeds a delete/move candidate's uid (itself sourced from
 _find_candidates) back into those endpoints — never a uid from a list read.
+
+PLATFORM (Phase 2 cloud deploy): `EventKit` is a macOS-only pyobjc binding
+and is NOT importable on Linux. Every function below that touches it does
+its own local `import EventKit` instead of one at module top, and
+`from __future__ import annotations` defers the type hints that name it
+(module-level `_store`, `_get_store`'s return type) so they're never
+evaluated at import time either. This keeps the module importable on the
+VPS (CALENDAR_BACKEND=google there, so this module's functions are simply
+never called) while still erroring loudly, from inside the function, if
+the eventkit read path is ever actually invoked on a box without it.
 """
+from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime
-
-import EventKit
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +66,7 @@ _STATUS_NAMES = {
 
 
 def _get_store() -> EventKit.EKEventStore:
+    import EventKit
     global _store
     if _store is None:
         _store = EventKit.EKEventStore.alloc().init()
@@ -68,6 +78,7 @@ async def _run(fn):
 
 
 def _permission_status_sync() -> str:
+    import EventKit
     try:
         status = EventKit.EKEventStore.authorizationStatusForEntityType_(EventKit.EKEntityTypeEvent)
     except Exception as exc:
@@ -82,6 +93,7 @@ def _request_access_sync() -> None:
     write_only) is never re-prompted, per the probe. Callers re-check
     _permission_status_sync() on their OWN next call; this never blocks
     waiting on the completion callback."""
+    import EventKit
     try:
         store = _get_store()
         if hasattr(store, "requestFullAccessToEventsWithCompletion_"):
@@ -101,21 +113,40 @@ async def permission_status() -> str:
 
 
 def _enumerate_calendars_sync() -> list[dict]:
+    import EventKit
     try:
         store = _get_store()
         cals = store.calendarsForEntityType_(EventKit.EKEntityTypeEvent)
-        return [{"title": c.title(), "writable": bool(c.allowsContentModifications())} for c in cals]
+        return [
+            {
+                "title": c.title(),
+                "writable": bool(c.allowsContentModifications()),
+                # The reliable "which account is this really on" signal —
+                # NOT title-matching, which collides across accounts (a
+                # Google "Home"/"Family"/"Birthdays" is not the same
+                # calendar as an iCloud one with the same name). Observed
+                # values on this machine: "iCloud", "Google", "Other"
+                # (Birthdays), "Subscribed Calendars" (a read-only ICS
+                # subscription, e.g. "US Holidays") — any non-"Google"
+                # source is invisible to the Google provider.
+                "source": c.source().title(),
+            }
+            for c in cals
+        ]
     except Exception as exc:
         log.error("[ek-read] enumerate_calendars crashed: %s", exc)
         return []
 
 
 async def enumerate_calendars() -> list[dict]:
-    """[{"title": str, "writable": bool}, ...] for every EventKit event
-    calendar — never raises, [] on any failure including no permission.
-    Callers that need to distinguish "no permission" from "genuinely no
-    calendars" should check permission_status() first, same contract as
-    read_window."""
+    """[{"title": str, "writable": bool, "source": str}, ...] for every
+    EventKit event calendar — never raises, [] on any failure including
+    no permission. `source` is the calendar's account (EKSource.title():
+    "iCloud", "Google", "Other", "Subscribed Calendars", ...) — the
+    reliable way to tell an Apple-only calendar apart from a Google one
+    when two calendars happen to share a display name. Callers that need
+    to distinguish "no permission" from "genuinely no calendars" should
+    check permission_status() first, same contract as read_window."""
     return await _run(_enumerate_calendars_sync)
 
 
@@ -129,6 +160,7 @@ def _to_local_naive_iso(ns_date) -> str | None:
 
 
 def _read_window_sync(start_dt: datetime, end_dt: datetime, writable_only: bool) -> dict:
+    import EventKit
     status = _permission_status_sync()
     if status != "full":
         _request_access_sync()

@@ -2,8 +2,11 @@
 Single entry point for the Pistachio backend.
 
 Runs two servers concurrently in one asyncio process:
-  • FastAPI HTTP API  — http://localhost:8000  (chat, memory, sleep)
-  • Gemini Live relay — ws://localhost:8765    (voice WebSocket)
+  • FastAPI HTTP API  — http://{API_HOST}:{API_PORT}  (chat, memory, sleep)
+  • Gemini Live relay — ws://{WS_HOST}:{WS_PORT}       (voice WebSocket)
+Both default to localhost-equivalent binds for local dev; Phase 2's cloud
+deploy sets API_HOST/WS_HOST=127.0.0.1 and fronts both with a TLS reverse
+proxy (Caddy) that's the only public listener.
 """
 
 import asyncio
@@ -39,6 +42,13 @@ log = logging.getLogger(__name__)
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 
+# Phase 2 cloud deploy: behind Caddy, both listeners bind loopback-only
+# (127.0.0.1) — Caddy is the one public listener and reverse-proxies in.
+# WS_HOST/WS_PORT default to 127.0.0.1:8765 for that reason; override via
+# env only for a setup with no reverse proxy in front.
+WS_HOST = os.getenv("WS_HOST", "127.0.0.1")
+WS_PORT = int(os.getenv("WS_PORT", "8765"))
+
 # ---------------------------------------------------------------------------
 # Gemini Live relay (voice WebSocket — ws://localhost:8765)
 # ---------------------------------------------------------------------------
@@ -48,7 +58,10 @@ _LIVE_LOCATION  = "us-west1"
 _LIVE_MODEL     = "gemini-live-2.5-flash-native-audio"
 _LIVE_SAMPLE_HZ = 16000
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google-key.json"
+# Local dev default stays "google-key.json" (relative, repo-root); the box
+# points VERTEX_KEY_PATH at the real secret-file path (e.g.
+# /etc/pistachio/google-key.json) instead.
+os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", os.getenv("VERTEX_KEY_PATH", "google-key.json"))
 _live_client = genai.Client(vertexai=True, project=_LIVE_PROJECT, location=_LIVE_LOCATION)
 
 
@@ -188,8 +201,8 @@ async def _handle_voice_client(ws) -> None:
 
 
 async def run_voice_relay() -> None:
-    log.debug("Starting Gemini Live relay on ws://localhost:8765")
-    async with websockets.serve(_handle_voice_client, "localhost", 8765):
+    log.debug("Starting Gemini Live relay on ws://%s:%s", WS_HOST, WS_PORT)
+    async with websockets.serve(_handle_voice_client, WS_HOST, WS_PORT):
         await asyncio.Future()   # run forever
 
 

@@ -1,12 +1,14 @@
 const {
   app, BrowserWindow, globalShortcut, ipcMain,
   screen, desktopCapturer, safeStorage,
-  Tray, Menu, nativeImage, powerMonitor,
+  Tray, Menu, nativeImage, powerMonitor, shell,
 } = require('electron');
 const path = require('path');
 const fs   = require('fs');
 const zlib = require('zlib');
-const { SUPABASE_URL, SUPABASE_ANON_KEY, API_BASE } = require('./config');
+const { SUPABASE_URL, SUPABASE_ANON_KEY, API_BASE, WS_BASE } = require('./config');
+console.log('[config] API_BASE=', API_BASE, 'WS_BASE=', WS_BASE);
+console.log('[config] env API=', process.env.PISTACHIO_API_BASE, 'env WS=', process.env.PISTACHIO_WS_BASE);
 
 
 // ---------------------------------------------------------------------------
@@ -526,12 +528,54 @@ ipcMain.handle('api:chat', async (_, { username, message, screenshot }) => {
   return data;
 });
 
+// Google Calendar connection (G3) — Connect opens the consent URL in the
+// SYSTEM BROWSER via shell.openExternal, never an in-app BrowserWindow:
+// Google refuses OAuth inside an embedded webview (disallowed_useragent).
+// The backend hosts the redirect callback and writes the refresh token
+// itself — this process never sees or handles it, same token-injection
+// pattern as every other api: handler for the status/disconnect calls.
+ipcMain.handle('api:googleConnectStart', async () => {
+  const token = await getValidToken();
+  const res = await fetch(`${API_BASE}/oauth/google/start`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  const bodyText = await res.text();
+  if (!res.ok) throw new Error(`Backend ${res.status}: ${bodyText.slice(0, 200)}`);
+  const { url } = JSON.parse(bodyText);
+  shell.openExternal(url);
+  return { opened: true };
+});
+
+ipcMain.handle('api:googleConnectionStatus', async () => {
+  const token = await getValidToken();
+  const res = await fetch(`${API_BASE}/calendar/connection_status`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  const bodyText = await res.text();
+  if (!res.ok) throw new Error(`Backend ${res.status}: ${bodyText.slice(0, 200)}`);
+  return JSON.parse(bodyText);
+});
+
+ipcMain.handle('api:googleDisconnect', async () => {
+  const token = await getValidToken();
+  const res = await fetch(`${API_BASE}/calendar/disconnect`, {
+    method:  'POST',
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+  const bodyText = await res.text();
+  if (!res.ok) throw new Error(`Backend ${res.status}: ${bodyText.slice(0, 200)}`);
+  return JSON.parse(bodyText);
+});
+
 // Follow-up disambiguation delete — resolves a client-held "the 6pm one" /
 // "yes, delete it" against a prior ambiguous/approximate delete_event()
 // result. Same token-injection pattern as api:chat; the backend runs its
 // own guarded delete_by_uid() (recurrence refusal, re-verify, confirm) and
 // its own fresh permission check, same as every other calendar action.
-ipcMain.handle('api:deleteByUid', async (_, { uid, calendar }) => {
+// scope (G4): undefined/null = ask-don't-act on a recurring target;
+// "instance" | "series" once the user has answered the "this one or all?"
+// prompt. Google-only — the backend's eventkit path ignores it.
+ipcMain.handle('api:deleteByUid', async (_, { uid, calendar, scope }) => {
   const token = await getValidToken();
   const res = await fetch(`${API_BASE}/calendar/delete_by_uid`, {
     method:  'POST',
@@ -539,7 +583,7 @@ ipcMain.handle('api:deleteByUid', async (_, { uid, calendar }) => {
       'Content-Type':  'application/json',
       'Authorization': `Bearer ${token}`,
     },
-    body: JSON.stringify({ uid, calendar }),
+    body: JSON.stringify({ uid, calendar, scope: scope || null }),
   });
   const bodyText = await res.text();
   if (!res.ok) throw new Error(`Backend ${res.status}: ${bodyText.slice(0, 200)}`);
@@ -552,7 +596,8 @@ ipcMain.handle('api:deleteByUid', async (_, { uid, calendar }) => {
 // uid. Same token-injection pattern as api:deleteByUid; the backend runs
 // its own guarded move_by_uid() (recurrence refusal, re-verify, safe-
 // ordered write, confirm read-back) and its own fresh permission check.
-ipcMain.handle('api:moveByUid', async (_, { uid, calendar, newStart, newEnd }) => {
+// scope (G4): same semantics as api:deleteByUid above.
+ipcMain.handle('api:moveByUid', async (_, { uid, calendar, newStart, newEnd, scope }) => {
   const token = await getValidToken();
   const res = await fetch(`${API_BASE}/calendar/move_by_uid`, {
     method:  'POST',
@@ -560,7 +605,7 @@ ipcMain.handle('api:moveByUid', async (_, { uid, calendar, newStart, newEnd }) =
       'Content-Type':  'application/json',
       'Authorization': `Bearer ${token}`,
     },
-    body: JSON.stringify({ uid, calendar, new_start: newStart, new_end: newEnd || null }),
+    body: JSON.stringify({ uid, calendar, new_start: newStart, new_end: newEnd || null, scope: scope || null }),
   });
   const bodyText = await res.text();
   if (!res.ok) throw new Error(`Backend ${res.status}: ${bodyText.slice(0, 200)}`);
