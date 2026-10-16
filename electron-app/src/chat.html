@@ -794,6 +794,14 @@
   // itself declines to recognize it as a correction.
   let pendingPlan = null;
 
+  // Phase 3 (NG4) — set when a desktop notification's accountability
+  // question is opened into this chat (onNudgeOpened below); the user's
+  // VERY NEXT typed message is, by construction of this UX, their reply
+  // to that one open question — sendMessage consumes this exactly once
+  // and reports it via nudgesAnswered, regardless of which dispatch path
+  // (normal chat, a disambig/plan reply) that message otherwise takes.
+  let pendingNudgeEventUid = null;
+
   const bc = new BroadcastChannel('pistachio');
 
   // ---------------------------------------------------------------------------
@@ -1658,6 +1666,16 @@
     if (!text.trim()) return;
     inputEl.value = '';
 
+    // Phase 3 (NG4): this message answers whatever nudge question is
+    // currently open, if any — consume-once, fire-and-forget (never
+    // blocks sending the actual message, and a failure here is non-fatal
+    // per nudgesAnswered's own contract in main.js).
+    if (pendingNudgeEventUid) {
+      const answeredEventUid = pendingNudgeEventUid;
+      pendingNudgeEventUid = null;
+      window.electronAPI.nudgesAnswered?.(answeredEventUid, text);
+    }
+
     if (disambig && looksLikeDisambiguation(text, disambig)) {
       addBubble(text, true);
       await handleDisambiguationReply(text);
@@ -1965,15 +1983,21 @@
     source.addEventListener('ended', () => clearInterval(lip));
   }
 
-  if (window.electronAPI?.onNudge) {
-    window.electronAPI.onNudge((data) => {
-      if (!data || !data.message) return;
-      addBubble(data.message, false);
-      const wm = data.working_memory || {};
-      updateChips(wm.mood || 'chill', wm.activity || 'unknown', wm.location || 'unknown');
-      bc.postMessage({ type: 'reply_expression', expression: classifyEmotion(data.message) });
-      bc.postMessage({ type: 'set_mood', mood: wm.mood || 'chill' });
-      if (data.audio_b64) playTtsAudio(data.audio_b64);
+  // Phase 3 (NG4) — a desktop notification's accountability question was
+  // clicked; main.js already focused/showed this window and sends the
+  // question here. Detection + the question text are already decided
+  // server-side (core/nudges.py) — this only DISPLAYS it and arms
+  // pendingNudgeEventUid so the user's next message reports the answer
+  // (see sendMessage). A fresh question supersedes whatever disambig/
+  // plan state was pending, same as any other genuinely new turn.
+  if (window.electronAPI?.onNudgeOpened) {
+    window.electronAPI.onNudgeOpened((data) => {
+      if (!data || !data.question) return;
+      disambig = null;
+      pendingPlan = null;
+      pendingNudgeEventUid = data.event_uid;
+      addBubble(data.question, false);
+      bc.postMessage({ type: 'reply_expression', expression: classifyEmotion(data.question) });
     });
   }
 

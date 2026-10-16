@@ -33,8 +33,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ── Backend proxy (main injects the token before forwarding) ─────────────
   sendChat:     (payload)         => ipcRenderer.invoke('api:chat',       payload),
   transcribe:   (audioB64)        => ipcRenderer.invoke('api:transcribe', audioB64),
-  nudge:        (payload)         => ipcRenderer.invoke('api:nudge',      payload),
-  onNudge:      (cb)              => ipcRenderer.on('nudge', (_, data) => cb(data)),
+  // Phase 3 (NG4) — accountability nudges. Detection + the pending-queue
+  // poll both live in main.js; the renderer only ever hears about an
+  // ALREADY-delivered nudge (via onNudgeOpened, when its notification is
+  // clicked) and reports the answer back (nudgesAnswered) once the
+  // user's reply has gone through the normal /chat path.
+  onNudgeOpened:   (cb) => ipcRenderer.on('nudge-opened', (_, data) => cb(data)),
+  nudgesAnswered:  (eventUid, response) => ipcRenderer.invoke('api:nudgesAnswered', { event_uid: eventUid, response }),
   googleConnectStart:     () => ipcRenderer.invoke('api:googleConnectStart'),
   googleConnectionStatus: () => ipcRenderer.invoke('api:googleConnectionStatus'),
   googleDisconnect:       () => ipcRenderer.invoke('api:googleDisconnect'),

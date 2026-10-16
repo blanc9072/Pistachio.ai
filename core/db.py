@@ -268,6 +268,139 @@ async def fetch_calendar_permissions(user_id: str) -> dict:
     return await _run(_)
 
 
+# ---------------------------------------------------------------------------
+# nudge_queue (Phase 3, NG1) — calendar-aware accountability nudges. One row
+# per just-ended event judged worth a check-in; (user_id, event_uid) is the
+# table's primary key, so enqueue_nudge's insert-on-conflict-skip IS the
+# dedup guarantee — a re-scan of the same event is a safe no-op, never a
+# second nudge for it.
+# ---------------------------------------------------------------------------
+
+async def fetch_accountability_nudges_enabled(user_id: str) -> bool:
+    """Return profiles.accountability_nudges_enabled. Default-deny: no
+    profile row, NULL column, or any DB error all return False — same
+    discipline as fetch_calendar_enabled above."""
+    def _():
+        try:
+            rows = (
+                _sb().table("profiles")
+                .select("accountability_nudges_enabled")
+                .eq("id", user_id)
+                .execute()
+                .data
+            )
+            return bool(rows[0].get("accountability_nudges_enabled")) if rows else False
+        except Exception:
+            log.warning("fetch_accountability_nudges_enabled failed for user=%s — defaulting to disabled", user_id)
+            return False
+    return await _run(_)
+
+
+async def enqueue_nudge(user_id: str, fields: dict) -> bool:
+    """Insert one pending nudge. `fields` carries event_uid, event_calendar,
+    event_title, event_start (ISO), event_end (ISO), question. Returns
+    False (never raises) on a PK conflict (this exact event was already
+    enqueued — the idempotency guarantee a caller relies on to re-scan
+    safely) OR any other DB error; True only on a genuine new insert."""
+    def _():
+        try:
+            _sb().table("nudge_queue").insert({"user_id": user_id, **fields}).execute()
+            return True
+        except Exception as exc:
+            log.info("enqueue_nudge: skipped for user=%s event_uid=%r (likely already queued): %s",
+                     user_id, fields.get("event_uid"), exc)
+            return False
+    return await _run(_)
+
+
+async def fetch_pending_nudges(user_id: str) -> list[dict]:
+    """Every status='pending' nudge for the user, oldest first. Empty list
+    on no rows or any DB error — never raises."""
+    def _():
+        try:
+            return (
+                _sb().table("nudge_queue")
+                .select("event_uid,event_calendar,event_title,question,event_start,event_end")
+                .eq("user_id", user_id)
+                .eq("status", "pending")
+                .order("event_end", desc=False)
+                .execute()
+                .data
+            )
+        except Exception:
+            log.warning("fetch_pending_nudges failed for user=%s — returning empty", user_id)
+            return []
+    return await _run(_)
+
+
+async def mark_nudges_delivered(user_id: str, event_uids: list[str]) -> None:
+    """Flip status pending -> delivered for the given event_uids, so the
+    client's next poll doesn't see them again. Never raises — a failure
+    here just means the SAME nudges may be re-delivered on the next poll,
+    which is a harmless duplicate notification, not a correctness bug."""
+    if not event_uids:
+        return
+    def _():
+        try:
+            (
+                _sb().table("nudge_queue")
+                .update({"status": "delivered", "delivered_at": datetime.now(timezone.utc).isoformat()})
+                .eq("user_id", user_id)
+                .in_("event_uid", event_uids)
+                .execute()
+            )
+        except Exception:
+            log.warning("mark_nudges_delivered failed for user=%s event_uids=%s", user_id, event_uids)
+    await _run(_)
+
+
+async def record_nudge_answer(user_id: str, event_uid: str, response: str) -> bool:
+    """Store the user's reply to a nudge and flip status -> answered.
+    Returns False (never raises) on any DB error."""
+    def _():
+        try:
+            (
+                _sb().table("nudge_queue")
+                .update({
+                    "status": "answered",
+                    "response": response,
+                    "answered_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("user_id", user_id)
+                .eq("event_uid", event_uid)
+                .execute()
+            )
+            return True
+        except Exception:
+            log.warning("record_nudge_answer failed for user=%s event_uid=%r", user_id, event_uid)
+            return False
+    return await _run(_)
+
+
+async def fetch_recent_nudge_history(user_id: str, since) -> list[dict]:
+    """Answered nudges since `since` (a datetime), oldest first — for
+    accountability recall (NG5). Structured facts only (title, question,
+    response, event_end): see THE notes WALL precedent in
+    scheduling_preferences above for why this stays narrow rather than
+    becoming a general free-text memory dump. Empty list on no rows or any
+    DB error — never raises."""
+    def _():
+        try:
+            return (
+                _sb().table("nudge_queue")
+                .select("event_title,question,response,event_end")
+                .eq("user_id", user_id)
+                .eq("status", "answered")
+                .gte("event_end", since.isoformat())
+                .order("event_end", desc=False)
+                .execute()
+                .data
+            )
+        except Exception:
+            log.warning("fetch_recent_nudge_history failed for user=%s", user_id)
+            return []
+    return await _run(_)
+
 
 # ---------------------------------------------------------------------------
 # scheduling_preferences

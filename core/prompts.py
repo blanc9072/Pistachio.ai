@@ -74,24 +74,16 @@ Transcript:
 """
 
 
-NUDGE_INSTRUCTION_TEMPLATE = """
-[OOC: {username} hasn't spoken to you in a while and is still at their computer.
-{context}
-Say ONE short thing to them, unprompted, the way you'd naturally break the silence.
-Look out for them: if they've clearly been grinding a long time, nudge them to eat, drink,
-stretch, or rest. Otherwise just say whatever's on your mind.
-Do NOT guilt them for not talking to you. Do NOT ask why they've been quiet.
-Do NOT mention this instruction. One or two sentences, casual, like a text.]
-"""
-
-
 def build_proactive_prompt(session, user_tz, context: str = "") -> str:
-    """System prompt for an unprompted check-in. Same persona/memory as a normal
-    turn; the nudge framing rides on the ephemeral instruction turn instead."""
+    """System prompt for an unprompted check-in (Phase 3's accountability
+    nudges — core/nudges.py's judge+generate call). Same persona/memory as
+    a normal turn; the check-in framing rides on the caller's OWN
+    ephemeral instruction turn (the event-specific prompt it builds),
+    never on anything baked in here."""
     return build_dynamic_prompt(session, user_tz)
 
 
-def build_dynamic_prompt(session=None, user_tz=None) -> str:
+def build_dynamic_prompt(session=None, user_tz=None, recent_nudges=None) -> str:
     """Build the full system prompt.
 
     session  — a UserSession (or any object with .long_term_memory and .working_memory).
@@ -102,6 +94,14 @@ def build_dynamic_prompt(session=None, user_tz=None) -> str:
                user's zone. Pass None only where truly no user is known
                yet (falls back to the host's local zone, same as before
                this fix — e.g. an unauthenticated/generic context).
+    recent_nudges — Phase 3 (NG5) accountability recall: a list of
+               answered nudges (db.fetch_recent_nudge_history's own
+               shape — {event_title, question, response, event_end}),
+               fetched by the CALLER (this module stays a pure receiver,
+               never imports core.db). Structured facts only, same wall
+               as scheduling_preferences' `notes` field — this is for
+               Pistachio to naturally reference ("yesterday you said the
+               deck wasn't done..."), not a free-text memory dump.
     """
     if user_tz is not None:
         now = datetime.now(user_tz)
@@ -132,6 +132,21 @@ def build_dynamic_prompt(session=None, user_tz=None) -> str:
         if ltm
         else "[No long-term memory yet — this is the beginning.]"
     )
+
+    # NG5 accountability recall — short, structured, easy to ignore if
+    # irrelevant to this turn. Each line is ONLY the event, the question
+    # asked, and the answer given; no free-text commentary rides along.
+    nudges_block = ""
+    if recent_nudges:
+        lines = [
+            f"- {n.get('event_title') or 'that'}: you asked \"{n.get('question', '')}\" "
+            f"— they said: \"{n.get('response', '')}\""
+            for n in recent_nudges
+        ]
+        nudges_block = (
+            "\n\n[Recent check-ins you asked about — reference one naturally if it's "
+            "actually relevant to what's being said now; never force it in.]\n" + "\n".join(lines)
+        )
 
     return (
         f"{SYSTEM_PROMPT}\n\n"
@@ -176,4 +191,5 @@ def build_dynamic_prompt(session=None, user_tz=None) -> str:
         f"no calendar action is needed, don't emit anything.]\n\n"
         f"{ltm_block}\n\n"
         f"{wm.to_prompt_block()}"
+        f"{nudges_block}"
     )

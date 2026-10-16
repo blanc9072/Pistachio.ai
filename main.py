@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import traceback
+from datetime import datetime, timedelta
 
 import uvicorn
 import websockets
@@ -65,10 +66,10 @@ os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", os.getenv("VERTEX_KEY_PA
 _live_client = genai.Client(vertexai=True, project=_LIVE_PROJECT, location=_LIVE_LOCATION)
 
 
-def _live_session_config(user_session=None, user_tz=None):
+def _live_session_config(user_session=None, user_tz=None, recent_nudges=None):
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction=build_dynamic_prompt(user_session, user_tz),
+        system_instruction=build_dynamic_prompt(user_session, user_tz, recent_nudges),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
@@ -112,6 +113,8 @@ async def _handle_voice_client(ws) -> None:
     user_session = await get_session(user_id)
     username     = await db.fetch_username(user_id)
     user_tz      = await db.fetch_user_timezone(user_id)
+    # NG5 accountability recall — same short window as the /chat path.
+    recent_nudges = await db.fetch_recent_nudge_history(user_id, datetime.now(user_tz) - timedelta(days=3))
 
     # Per-turn transcript buffers; flushed to DB in the finally block.
     pending_turns: list[tuple[str, str]] = []
@@ -119,7 +122,7 @@ async def _handle_voice_client(ws) -> None:
 
     try:
         async with _live_client.aio.live.connect(
-            model=_LIVE_MODEL, config=_live_session_config(user_session, user_tz)
+            model=_LIVE_MODEL, config=_live_session_config(user_session, user_tz, recent_nudges)
         ) as session:
             log.debug("[Voice] Gemini Live session opened.")
 
@@ -208,6 +211,38 @@ async def run_voice_relay() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 (NG3) — accountability nudge scanner. Always-on, server-side, so
+# detection doesn't depend on the Electron app being open (and a future
+# mobile push can consume the same nudge_queue). Runs alongside the API
+# and voice relay on this same asyncio loop, same pattern as both.
+# ---------------------------------------------------------------------------
+
+_NUDGE_SCAN_INTERVAL_SEC = 240  # 4 min — inside STALENESS_CAP's 4h window with margin to spare
+
+# Single-user today — the dev user. The loop below already iterates a
+# list, so adding real multi-user support later is "fetch the active
+# user_id list from db" at this one call site, not a restructuring.
+_ACTIVE_USER_IDS = ["fa29e410-27a4-402c-9383-20b4c282ce1b"]
+
+
+async def run_nudge_scanner() -> None:
+    from core.nudges import scan_and_enqueue
+
+    while True:
+        for user_id in _ACTIVE_USER_IDS:
+            try:
+                user_tz = await db.fetch_user_timezone(user_id)
+                n = await scan_and_enqueue(user_id, user_tz)
+                if n:
+                    log.info("[nudges] scan enqueued %d nudge(s) for user=%s", n, user_id)
+            except Exception as exc:
+                # One user's/cycle's failure must never crash the backend
+                # or stop future cycles — log and move on.
+                log.warning("[nudges] scan cycle failed for user=%s: %s", user_id, exc)
+        await asyncio.sleep(_NUDGE_SCAN_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI HTTP server
 # ---------------------------------------------------------------------------
 
@@ -226,6 +261,7 @@ async def main() -> None:
     results = await asyncio.gather(
         run_api(),
         run_voice_relay(),
+        run_nudge_scanner(),
         return_exceptions=True,
     )
     for r in results:

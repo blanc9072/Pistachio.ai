@@ -1,7 +1,7 @@
 const {
   app, BrowserWindow, globalShortcut, ipcMain,
   screen, desktopCapturer, safeStorage,
-  Tray, Menu, nativeImage, powerMonitor, shell,
+  Tray, Menu, nativeImage, shell, Notification,
 } = require('electron');
 const path = require('path');
 const fs   = require('fs');
@@ -235,15 +235,15 @@ let tray              = null;
 let screenWatchEnabled = false;
 let isQuitting         = false;   // set true by the tray "Quit" item so window-all-closed lets us exit
 let dndEnabled         = false;
-let lastNudgeAt        = 0;
-let lastUserSpokeAt    = Date.now();
-const NUDGE_CHECK_MS     = 60_000;
-const NUDGE_MIN_GAP_MS   = 45 * 60_000; // 45 *  
-const NUDGE_SESSION_MS   = 90 * 60_000; // 90 *
-const NUDGE_QUIET_IDLE_S = 300;
 let cursorPollTimer    = null;
-let nudgeTimer         = null;
-let nudgeInFlight      = false;
+// Phase 3 (NG4) — accountability nudges poll. Replaces the old idle-timer
+// nudge entirely: detection is server-side and always-on (main.py's
+// run_nudge_scanner); this is only DELIVERY, polling the queue and
+// raising a desktop notification. dndEnabled (already wired to the tray's
+// "Do Not Disturb"/"Check-ins" toggle) mutes delivery without touching
+// detection — see pollNudges below.
+const NUDGE_POLL_MS = 3 * 60_000; // 3 min
+let nudgePollTimer    = null;
 
 // Fully exit the app. window-all-closed normally keeps us alive in the tray, so
 // we flag the intentional quit first, then app.quit(). The timeout force-exits
@@ -314,8 +314,8 @@ function teardownTray() {
 }
 
 function stopTimers() {
-  if (cursorPollTimer) { clearInterval(cursorPollTimer); cursorPollTimer = null; }
-  if (nudgeTimer)      { clearInterval(nudgeTimer);      nudgeTimer      = null; }
+  if (cursorPollTimer)  { clearInterval(cursorPollTimer);  cursorPollTimer  = null; }
+  if (nudgePollTimer)   { clearInterval(nudgePollTimer);   nudgePollTimer   = null; }
 }
 
 // No custom app menu is set, so macOS falls back to its default menu, whose
@@ -409,8 +409,6 @@ function toggleChat() {
 function launchApp() {
   stopTimers();
   globalShortcut.unregisterAll();
-  lastNudgeAt     = 0;
-  lastUserSpokeAt = Date.now();
 
   createModelWindow();
   createChatWindow();
@@ -432,7 +430,7 @@ function launchApp() {
     }
   }, 16);
 
-  nudgeTimer = setInterval(maybeNudge, NUDGE_CHECK_MS);
+  nudgePollTimer = setInterval(pollNudges, NUDGE_POLL_MS);
 
   globalShortcut.register('CommandOrControl+Shift+P', toggleChat);
 
@@ -518,7 +516,6 @@ ipcMain.handle('auth:getUser', () => {
 // ---------------------------------------------------------------------------
 
 ipcMain.handle('api:chat', async (_, { username, message, screenshot }) => {
-  lastUserSpokeAt = Date.now();
   const token = await getValidToken();
   const res = await fetch(`${API_BASE}/chat`, {
     method:  'POST',
@@ -707,66 +704,55 @@ ipcMain.handle('api:resetSchedulingPrefs', async (_, { activity }) => {
   return JSON.parse(bodyText);
 });
 
-async function ipcNudgeCall(payload) {
-  const token = await getValidToken();
-  const res = await fetch(`${API_BASE}/nudge`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-    body:    JSON.stringify(payload),
-    signal:  AbortSignal.timeout(40_000),
-  });
-  if (res.status === 429) return null;
-  if (!res.ok) throw new Error(`Nudge ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-ipcMain.handle('api:nudge', async (_, payload) => {
-  return ipcNudgeCall(payload);
-});
-
-async function maybeNudge() {
-  if (dndEnabled || !session || !chatWindow || chatWindow.isDestroyed()) return;
-  const now = Date.now();
-  if (now - lastNudgeAt     < NUDGE_MIN_GAP_MS) return;
-  if (now - lastUserSpokeAt < NUDGE_SESSION_MS) return;
-  if (nudgeInFlight) return;
-
-  let idle = 0;
-  try { idle = powerMonitor.getSystemIdleTime(); } catch (e) { return; }
-  if (idle > NUDGE_QUIET_IDLE_S) return;
-
-  let screenshot = null;
-  if (screenWatchEnabled) {
-    try {
-      const sources = await desktopCapturer.getSources({
-        types: ['screen'], thumbnailSize: { width: 1920, height: 1080 },
-      });
-      if (sources.length) screenshot = sources[0].thumbnail.toDataURL().split(',')[1];
-    } catch (e) { /* no screenshot, carry on */ }
-  }
-
-  const mins = Math.round((now - lastUserSpokeAt) / 60000);
-  const context  = `Still at their computer. Last spoke with you about ${mins} minutes ago.`;
-  const username = (session.email || 'user').split('@')[0];
-
-  nudgeInFlight = true;
+// Phase 3 (NG4) — delivery half of the accountability nudge loop.
+// Detection already happened server-side (main.py's run_nudge_scanner);
+// this only polls the queue and raises a native notification per pending
+// nudge. dndEnabled mutes delivery ONLY — the server keeps detecting and
+// queuing regardless, so nothing is lost, it just waits for DnD to turn
+// off (or the next poll after that).
+async function pollNudges() {
+  if (dndEnabled || !session) return;
   try {
-    const data = await ipcNudgeCall({ username, context, screenshot });
-    if (!data || !data.message) { lastNudgeAt = Date.now(); return; }
-    lastNudgeAt = Date.now();
-    if (modelWindow && !modelWindow.isDestroyed()) {
-      modelWindow.webContents.send('nudge', data);
-    }
-    if (chatWindow && !chatWindow.isDestroyed()) {
-      chatWindow.webContents.send('nudge', data);
+    const token = await getValidToken();
+    const res = await fetch(`${API_BASE}/nudges/pending`, {
+      headers: { 'Authorization': `Bearer ${token}` },
+      signal:  AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return;
+    const { nudges } = await res.json();
+    for (const n of (nudges || [])) {
+      const notif = new Notification({ title: 'Pistachio', body: n.question });
+      notif.on('click', () => {
+        if (!chatWindow || chatWindow.isDestroyed()) return;
+        if (!chatVisible) { chatWindow.show(); chatWindow.focus(); chatVisible = true; }
+        else { chatWindow.focus(); }
+        chatWindow.webContents.send('nudge-opened', { event_uid: n.event_uid, question: n.question });
+      });
+      notif.show();
     }
   } catch (e) {
-    lastNudgeAt = Date.now();
-    console.warn('[nudge] failed (non-fatal):', e.message);
-  } finally {
-    nudgeInFlight = false;
+    console.warn('[nudges] poll failed (non-fatal):', e.message);
   }
 }
+
+// Called by the renderer once the user's reply to an opened nudge
+// question has been sent through the normal /chat path — closes the
+// accountability loop by recording the answer against the event.
+ipcMain.handle('api:nudgesAnswered', async (_, { event_uid, response }) => {
+  try {
+    const token = await getValidToken();
+    const res = await fetch(`${API_BASE}/nudges/answered`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body:    JSON.stringify({ event_uid, response }),
+      signal:  AbortSignal.timeout(10_000),
+    });
+    return { ok: res.ok };
+  } catch (e) {
+    console.warn('[nudges] answered call failed (non-fatal):', e.message);
+    return { ok: false };
+  }
+});
 
 ipcMain.handle('api:transcribe', async (_, audioB64) => {
   const token = await getValidToken();

@@ -108,9 +108,10 @@ MEMORY_MODEL = "gemini-2.5-flash"
 # silently fall back to the description path without ever retrying that way.
 _direct_vision_ok = True
 
-_NUDGE_MAX_PER_DAY = 6
-_NUDGE_MIN_GAP_SEC = 45 * 60
-_nudge_log: dict[str, list[float]] = {}
+# Phase 3 (NG5) — how far back accountability recall looks for answered
+# nudges to surface in the prompt. Short on purpose: this is "yesterday
+# you said..." recall, not a general history dump.
+_NUDGE_RECALL_WINDOW = timedelta(days=3)
 
 # Resolver tool name -> per-action permission key in fetch_calendar_permissions().
 # create_event/list_events/delete_event/move_event/suggest_slots are all
@@ -126,20 +127,6 @@ _CALENDAR_TOOL_PERMISSIONS = {
     "suggest_slots": "list",
 }
 
-
-def _nudge_allowed(user_id: str) -> bool:
-    import time
-    now = time.time()
-    hits = [t for t in _nudge_log.get(user_id, []) if now - t < 86400]
-    _nudge_log[user_id] = hits
-    if len(hits) >= _NUDGE_MAX_PER_DAY: return False
-    if hits and now - hits[-1] < _NUDGE_MIN_GAP_SEC: return False
-    return True
-
-
-def _nudge_record(user_id: str) -> None:
-    import time
-    _nudge_log.setdefault(user_id, []).append(time.time())
 
 app = FastAPI(title="Pistachio API")
 
@@ -207,6 +194,11 @@ class TimezoneRequest(BaseModel):
     tz: str
 
 
+class AnsweredNudgeRequest(BaseModel):
+    event_uid: str
+    response: str
+
+
 class SlotIn(BaseModel):
     start: str
     end:   str
@@ -264,18 +256,6 @@ class CorrectPlanRequest(BaseModel):
 
 class TranscribeRequest(BaseModel):
     audio_b64: str   # base64-encoded WAV at any sample rate
-
-
-class NudgeRequest(BaseModel):
-    username:   str
-    context:    str | None = None
-    screenshot: str | None = None
-
-
-class NudgeResponse(BaseModel):
-    message:        str
-    working_memory: dict
-    audio_b64:      str | None = None
 
 
 class MemoryResponse(BaseModel):
@@ -832,6 +812,10 @@ async def chat(
 
     session = await get_session(user_id)
     user_tz = await db.fetch_user_timezone(user_id)
+    # NG5 accountability recall — short recent window, structured facts
+    # only (see build_dynamic_prompt's own docstring for the wall this
+    # respects). Fetched once per turn, same as user_tz above.
+    recent_nudges = await db.fetch_recent_nudge_history(user_id, datetime.now(user_tz) - _NUDGE_RECALL_WINDOW)
 
     async with session.lock:
         message_text = f"[{req.username}]: {req.message}"
@@ -855,7 +839,7 @@ async def chat(
 
         try:
             reply = await asyncio.wait_for(
-                generate_reply(session.contents, build_dynamic_prompt(session, user_tz)),
+                generate_reply(session.contents, build_dynamic_prompt(session, user_tz, recent_nudges)),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
@@ -876,7 +860,7 @@ async def chat(
                 await session.append("user", retry_text)
                 try:
                     reply = await asyncio.wait_for(
-                        generate_reply(session.contents, build_dynamic_prompt(session, user_tz)),
+                        generate_reply(session.contents, build_dynamic_prompt(session, user_tz, recent_nudges)),
                         timeout=30.0,
                     )
                 except Exception as retry_exc:
@@ -1475,70 +1459,27 @@ async def reset_scheduling_prefs(
     return {"status": "ok" if ok else "error", "cleared": cleared if ok else []}
 
 
-@app.post("/nudge", response_model=NudgeResponse)
-async def nudge(req: NudgeRequest, user_id: str = Depends(get_current_user)):
-    from core.prompts import NUDGE_INSTRUCTION_TEMPLATE, build_proactive_prompt
-    global _direct_vision_ok
+@app.get("/nudges/pending")
+async def nudges_pending(user_id: str = Depends(get_current_user)):
+    """Phase 3 (NG3) — the client polls this every few minutes. Returns
+    every pending nudge and, in the SAME call, marks them delivered so a
+    later poll doesn't surface them again. Marking-as-delivered failing
+    is non-fatal (see db.mark_nudges_delivered) — worst case is a
+    harmless duplicate notification on the next poll, never a lost one.
+    """
+    pending = await db.fetch_pending_nudges(user_id)
+    if pending:
+        await db.mark_nudges_delivered(user_id, [p["event_uid"] for p in pending])
+    return {"nudges": pending}
 
-    if not _nudge_allowed(user_id):
-        raise HTTPException(status_code=429, detail="Nudge limit reached.")
 
-    session = await get_session(user_id)
-    user_tz = await db.fetch_user_timezone(user_id)
-    async with session.lock:
-        ctx = req.context or ""
-        image_bytes = base64.b64decode(req.screenshot) if req.screenshot else None
-
-        if image_bytes and not _direct_vision_ok:
-            desc = await describe_screen(image_bytes)
-            if desc:
-                ctx += f"\n[Screen: {desc}]"
-            image_bytes = None
-
-        instruction = NUDGE_INSTRUCTION_TEMPLATE.format(username=req.username, context=ctx)
-        parts = ([types.Part.from_bytes(data=image_bytes, mime_type="image/png")]
-                 if image_bytes and _direct_vision_ok else [])
-        parts.append(types.Part.from_text(text=instruction))
-        contents = session.contents + [types.Content(role="user", parts=parts)]
-
-        try:
-            message = await asyncio.wait_for(
-                generate_reply(contents, build_proactive_prompt(session, user_tz, ctx), grounding=False),
-                timeout=30.0,
-            )
-        except asyncio.TimeoutError:
-            raise HTTPException(status_code=504, detail="Gemini timed out.")
-        except Exception as exc:
-            log.error("Nudge generation error: %s", exc)
-            raise HTTPException(status_code=500, detail=str(exc))
-
-        if not message:
-            raise HTTPException(status_code=500, detail="No nudge generated.")
-
-        await session.append("assistant", message)
-        _nudge_record(user_id)
-        asyncio.create_task(session.compress_rolling(gemini_client, MEMORY_MODEL))
-        asyncio.create_task(session.update_working_memory(gemini_client, MEMORY_MODEL))
-
-        audio_b64: str | None = None
-        try:
-            tts_ref = await db.fetch_voice_tts_ref(user_id)
-            if tts_ref:
-                audio_bytes = await tts.synthesize(message, tts_ref)
-                if audio_bytes:
-                    audio_b64 = base64.b64encode(audio_bytes).decode()
-        except Exception as exc:
-            log.warning("TTS failed (non-fatal): %s", exc)
-
-        return NudgeResponse(
-            message=message,
-            working_memory={
-                "location": session.working_memory.location,
-                "activity": session.working_memory.activity,
-                "mood":     session.working_memory.mood,
-            },
-            audio_b64=audio_b64,
-        )
+@app.post("/nudges/answered")
+async def nudges_answered(req: AnsweredNudgeRequest, user_id: str = Depends(get_current_user)):
+    """Phase 3 (NG3) — called after the user replies to a delivered
+    nudge's question, so the accountability loop (NG5 recall) has a
+    recorded answer tied to the event."""
+    ok = await db.record_nudge_answer(user_id, req.event_uid, req.response)
+    return {"status": "ok" if ok else "error"}
 
 
 @app.get("/profile")
