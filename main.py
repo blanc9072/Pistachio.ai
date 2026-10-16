@@ -65,10 +65,10 @@ os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", os.getenv("VERTEX_KEY_PA
 _live_client = genai.Client(vertexai=True, project=_LIVE_PROJECT, location=_LIVE_LOCATION)
 
 
-def _live_session_config(user_session=None):
+def _live_session_config(user_session=None, user_tz=None):
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
-        system_instruction=build_dynamic_prompt(user_session),
+        system_instruction=build_dynamic_prompt(user_session, user_tz),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
@@ -111,6 +111,7 @@ async def _handle_voice_client(ws) -> None:
 
     user_session = await get_session(user_id)
     username     = await db.fetch_username(user_id)
+    user_tz      = await db.fetch_user_timezone(user_id)
 
     # Per-turn transcript buffers; flushed to DB in the finally block.
     pending_turns: list[tuple[str, str]] = []
@@ -118,7 +119,7 @@ async def _handle_voice_client(ws) -> None:
 
     try:
         async with _live_client.aio.live.connect(
-            model=_LIVE_MODEL, config=_live_session_config(user_session)
+            model=_LIVE_MODEL, config=_live_session_config(user_session, user_tz)
         ) as session:
             log.debug("[Voice] Gemini Live session opened.")
 

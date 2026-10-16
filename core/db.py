@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from supabase import create_client, Client
 
@@ -388,6 +389,62 @@ async def fetch_username(user_id: str) -> str:
             return email.split("@")[0] if email else "user"
         except Exception:
             return "user"
+    return await _run(_)
+
+
+# ---------------------------------------------------------------------------
+# timezone — per-user IANA zone, so "now"/"today" and event times are
+# computed in the USER's zone, never the host's (see the timezone-
+# correctness fix: the host running the backend is no longer necessarily
+# in the user's zone once deployed to a cloud box).
+# ---------------------------------------------------------------------------
+
+async def fetch_user_timezone(user_id: str) -> ZoneInfo:
+    """The user's stored IANA zone as a ZoneInfo, or a fallback — never
+    raises. Falls back through: no profile row / NULL column / DB error /
+    an invalid stored string -> DEFAULT_TZ env var -> "UTC". A bad stored
+    value must never propagate as an exception into a chat turn."""
+    def _():
+        try:
+            rows = (
+                _sb().table("profiles")
+                .select("timezone")
+                .eq("id", user_id)
+                .execute()
+                .data
+            )
+            tz_name = rows[0].get("timezone") if rows else None
+            if tz_name:
+                try:
+                    return ZoneInfo(tz_name)
+                except (ZoneInfoNotFoundError, ValueError):
+                    log.warning("fetch_user_timezone: invalid stored zone %r for user=%s — falling back", tz_name, user_id)
+        except Exception:
+            log.warning("fetch_user_timezone failed for user=%s — falling back", user_id)
+        try:
+            return ZoneInfo(os.getenv("DEFAULT_TZ", "UTC"))
+        except (ZoneInfoNotFoundError, ValueError):
+            return ZoneInfo("UTC")
+    return await _run(_)
+
+
+async def update_user_timezone(user_id: str, tz: str) -> bool:
+    """Validate and store the user's IANA zone. Returns False (never
+    raises) on an invalid zone name or any DB error, so a bad client-
+    supplied string can't corrupt the stored value or crash the caller."""
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning("update_user_timezone: rejected invalid zone %r for user=%s", tz, user_id)
+        return False
+
+    def _():
+        try:
+            _sb().table("profiles").update({"timezone": tz}).eq("id", user_id).execute()
+            return True
+        except Exception:
+            log.warning("update_user_timezone: DB write failed for user=%s", user_id)
+            return False
     return await _run(_)
 
 

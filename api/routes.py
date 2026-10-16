@@ -203,6 +203,10 @@ class MoveByUidRequest(BaseModel):
     scope:     str | None = None
 
 
+class TimezoneRequest(BaseModel):
+    tz: str
+
+
 class SlotIn(BaseModel):
     start: str
     end:   str
@@ -386,7 +390,7 @@ async def transcribe_audio(
 # separate EventKit read, fresh on that later turn) are redirected here.
 # ---------------------------------------------------------------------------
 
-async def _list_events_from_ek(user_id: str, args: dict, enabled: bool) -> dict:
+async def _list_events_from_ek(user_id: str, args: dict, enabled: bool, user_tz) -> dict:
     """The DISPLAY read (list_events' single-day AND range paths), via
     calendar_backend (G2b-2) — backend-agnostic, EventKit or Google
     depending on CALENDAR_BACKEND. Mirrors calendar_executor.list_events's
@@ -424,7 +428,7 @@ async def _list_events_from_ek(user_id: str, args: dict, enabled: bool) -> dict:
 
         range_start = start_dt
         range_end = end_dt.replace(hour=23, minute=59, second=59)
-        read = await calendar_backend.read_window(user_id, range_start, range_end, writable_only=False)
+        read = await calendar_backend.read_window(user_id, range_start, range_end, writable_only=False, user_tz=user_tz)
         if read["status"] == "needs_setup":
             return {"status": "needs_permission", "kind": "list", "events": [],
                     "window_start": window_start_iso, "window_end": window_end_iso,
@@ -437,7 +441,7 @@ async def _list_events_from_ek(user_id: str, args: dict, enabled: bool) -> dict:
                 "window_start": window_start_iso, "window_end": window_end_iso,
                 "events": read["events"]}
 
-    target = _resolve_list_date(args.get("date"))
+    target = _resolve_list_date(args.get("date"), user_tz)
     date_iso = target.strftime("%Y-%m-%d")
 
     if not enabled:
@@ -446,7 +450,7 @@ async def _list_events_from_ek(user_id: str, args: dict, enabled: bool) -> dict:
 
     start_dt = target
     end_dt = target.replace(hour=23, minute=59, second=59)
-    read = await calendar_backend.read_window(user_id, start_dt, end_dt, writable_only=False)
+    read = await calendar_backend.read_window(user_id, start_dt, end_dt, writable_only=False, user_tz=user_tz)
     if read["status"] == "needs_setup":
         return {"status": "needs_permission", "kind": "list", "events": [],
                 "date": date_iso, "message": read.get("message") or calendar_backend.setup_message()}
@@ -457,7 +461,7 @@ async def _list_events_from_ek(user_id: str, args: dict, enabled: bool) -> dict:
 
 
 async def _ek_busy_events(
-    user_id: str, start_dt: datetime, end_dt: datetime, writable_only: bool,
+    user_id: str, start_dt: datetime, end_dt: datetime, writable_only: bool, user_tz,
 ) -> tuple[str, list[dict]]:
     """The scheduler's PROPOSE-step busy-set, read live via
     calendar_backend (G2b-2) instead of a live osascript
@@ -476,7 +480,7 @@ async def _ek_busy_events(
     proposing here safe even against a just-changed calendar; it is not
     touched or weakened by this function.
     """
-    read = await calendar_backend.read_window(user_id, start_dt, end_dt, writable_only)
+    read = await calendar_backend.read_window(user_id, start_dt, end_dt, writable_only, user_tz=user_tz)
     if read["status"] != "ok":
         return read["status"], []
 
@@ -530,7 +534,7 @@ def _plan_result(status: str, activity: str, **extra) -> dict:
 
 async def _place_plan(
     user_id: str, activity: str, block: dict, window_start: datetime, window_end: datetime,
-    count: int, tod_pref: str | None, day_exclusions: set,
+    count: int, tod_pref: str | None, day_exclusions: set, user_tz,
 ) -> dict:
     """The shared placement TAIL of the scheduler pipeline: the PROPOSE
     step's busy-set read (live via calendar_backend — G2b-2, fast, no
@@ -556,7 +560,7 @@ async def _place_plan(
     original request's window.
     """
     range_end = window_end.replace(hour=23, minute=59, second=59)
-    busy_status, busy = await _ek_busy_events(user_id, window_start, range_end, writable_only=True)
+    busy_status, busy = await _ek_busy_events(user_id, window_start, range_end, writable_only=True, user_tz=user_tz)
     if busy_status == "needs_setup":
         return _plan_result("needs_permission", activity, message=calendar_backend.setup_message())
     if busy_status != "ok":
@@ -571,7 +575,7 @@ async def _place_plan(
 
     slots = place_slots(
         busy, block["block_min"], count, window_days,
-        tod_pref=tod_pref, hours=(8, 22), now=datetime.now(),
+        tod_pref=tod_pref, hours=(8, 22), now=datetime.now(user_tz),
     )
 
     status = "plan" if slots else "plan_empty"
@@ -594,7 +598,7 @@ async def _place_plan(
     return result
 
 
-async def _suggest_slots_plan(args: dict, user_id: str) -> dict:
+async def _suggest_slots_plan(args: dict, user_id: str, user_tz) -> dict:
     """Orchestrates one suggest_slots turn end to end:
       1. Gate on "list" (proposing only READS the calendar).
       2. stored_pref = fetch_scheduling_preference (S1) — numeric fields
@@ -661,7 +665,7 @@ async def _suggest_slots_plan(args: dict, user_id: str) -> dict:
     effective_tod_pref = requested_tod_pref or block.get("tod_pref")
 
     return await _place_plan(
-        user_id, activity, block, window_start, window_end, count, effective_tod_pref, day_exclusions,
+        user_id, activity, block, window_start, window_end, count, effective_tod_pref, day_exclusions, user_tz,
     )
 
 
@@ -827,6 +831,7 @@ async def chat(
     log.debug("Chat from user_id=%s username=%s", user_id, req.username)
 
     session = await get_session(user_id)
+    user_tz = await db.fetch_user_timezone(user_id)
 
     async with session.lock:
         message_text = f"[{req.username}]: {req.message}"
@@ -850,7 +855,7 @@ async def chat(
 
         try:
             reply = await asyncio.wait_for(
-                generate_reply(session.contents, build_dynamic_prompt(session)),
+                generate_reply(session.contents, build_dynamic_prompt(session, user_tz)),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
@@ -871,7 +876,7 @@ async def chat(
                 await session.append("user", retry_text)
                 try:
                     reply = await asyncio.wait_for(
-                        generate_reply(session.contents, build_dynamic_prompt(session)),
+                        generate_reply(session.contents, build_dynamic_prompt(session, user_tz)),
                         timeout=30.0,
                     )
                 except Exception as retry_exc:
@@ -897,7 +902,7 @@ async def chat(
             reply = re.sub(r"<action>.*?</action>", "", reply, flags=re.IGNORECASE | re.DOTALL).strip()
             log.info("[tool-signal] calendar action requested: %r", action_request)
             try:
-                resolved = await resolve_calendar_action(action_request)
+                resolved = await resolve_calendar_action(action_request, user_tz)
                 log.info("[stage2] result: status=%s tool=%s args=%r",
                          resolved.status, resolved.tool, resolved.args)
                 # Stage 3: actually execute resolved calendar actions. Never
@@ -915,22 +920,22 @@ async def chat(
                     cal_enabled = perms["master"] and perms.get(action_key, False)
                     if resolved.tool == "create_event":
                         calendar_action = await calendar_backend.create_event(
-                            user_id, resolved.args, cal_enabled,
+                            user_id, resolved.args, cal_enabled, user_tz,
                         )
                     elif resolved.tool == "list_events":
                         # G2b-2: the display read goes through the backend
                         # seam — EventKit or Google per CALENDAR_BACKEND —
                         # see the "Calendar reads" section above.
                         calendar_action = await _list_events_from_ek(
-                            user_id, resolved.args, enabled=cal_enabled,
+                            user_id, resolved.args, enabled=cal_enabled, user_tz=user_tz,
                         )
                     elif resolved.tool == "move_event":
                         calendar_action = await calendar_backend.move_event(
-                            user_id, resolved.args, cal_enabled,
+                            user_id, resolved.args, cal_enabled, user_tz,
                         )
                     else:
                         calendar_action = await calendar_backend.delete_event(
-                            user_id, resolved.args, cal_enabled,
+                            user_id, resolved.args, cal_enabled, user_tz,
                         )
                     log.info("[stage3] execution result (tool=%s calendar_enabled=%s): %s",
                              resolved.tool, cal_enabled, calendar_action)
@@ -939,7 +944,7 @@ async def chat(
                     # infer_block + a live window read + place_slots) fetches
                     # permissions itself since it gates on "list" rather than
                     # the per-tool map's default lookup used above.
-                    calendar_action = await _suggest_slots_plan(resolved.args, user_id)
+                    calendar_action = await _suggest_slots_plan(resolved.args, user_id, user_tz)
                     log.info("[stage3] suggest_slots execution result: %s", calendar_action)
             except Exception as exc:
                 log.warning("[stage2/3] calendar tool pipeline failed (non-fatal): %s", exc)
@@ -1177,7 +1182,8 @@ async def calendar_delete_by_uid(
     """
     perms = await db.fetch_calendar_permissions(user_id)
     enabled = perms["master"] and perms.get("delete", False)
-    result = await calendar_backend.delete_by_uid(user_id, req.uid, req.calendar, enabled, scope=req.scope)
+    user_tz = await db.fetch_user_timezone(user_id)
+    result = await calendar_backend.delete_by_uid(user_id, req.uid, req.calendar, enabled, user_tz, scope=req.scope)
     log.info("[calendar] delete_by_uid uid=%s calendar=%r enabled=%s scope=%r -> %s",
              req.uid, req.calendar, enabled, req.scope, result)
     return result
@@ -1203,7 +1209,8 @@ async def calendar_move_by_uid(
     """
     perms = await db.fetch_calendar_permissions(user_id)
     enabled = perms["master"] and perms.get("move", False)
-    result = await calendar_backend.move_by_uid(user_id, req.uid, req.calendar, req.new_start, req.new_end, enabled, scope=req.scope)
+    user_tz = await db.fetch_user_timezone(user_id)
+    result = await calendar_backend.move_by_uid(user_id, req.uid, req.calendar, req.new_start, req.new_end, enabled, user_tz, scope=req.scope)
     log.info("[calendar] move_by_uid uid=%s calendar=%r new_start=%r enabled=%s scope=%r -> %s",
              req.uid, req.calendar, req.new_start, enabled, req.scope, result)
     return result
@@ -1241,6 +1248,7 @@ async def calendar_add_slots(
             "added": [], "skipped": [],
         }
 
+    user_tz = await db.fetch_user_timezone(user_id)
     activity = (req.activity or "").strip()
     parsed_slots = []
     for s in req.slots:
@@ -1257,7 +1265,7 @@ async def calendar_add_slots(
 
     window_start = min(s for s, _ in parsed_slots)
     window_end = max(e for _, e in parsed_slots)
-    fresh = await calendar_backend.read_window(user_id, window_start, window_end, writable_only=True)
+    fresh = await calendar_backend.read_window(user_id, window_start, window_end, writable_only=True, user_tz=user_tz)
     if fresh["status"] == "needs_setup":
         return {
             "status": "needs_permission", "kind": "plan_added",
@@ -1291,7 +1299,7 @@ async def calendar_add_slots(
             skipped.append(slot_out)
             continue
         result = await calendar_backend.create_event(
-            user_id, {"title": activity, "start": start.isoformat(), "end": end.isoformat()}, enabled,
+            user_id, {"title": activity, "start": start.isoformat(), "end": end.isoformat()}, enabled, user_tz,
         )
         if result.get("status") == "success":
             added.append(slot_out)
@@ -1359,6 +1367,7 @@ async def calendar_correct_plan(
             message="I need to see your calendar to plan — turn on List in Settings.",
         )
 
+    user_tz = await db.fetch_user_timezone(user_id)
     breakdown = [b.model_dump() for b in req.breakdown]
     delta = await _interpret_correction(req.activity, req.correction_text, breakdown)
     if delta is None:
@@ -1397,7 +1406,7 @@ async def calendar_correct_plan(
     effective_tod_pref = corrected_pref.get("tod_pref") or block.get("tod_pref")
 
     plan = await _place_plan(
-        user_id, req.activity, block, window_start, window_end, req.count, effective_tod_pref, day_exclusions,
+        user_id, req.activity, block, window_start, window_end, req.count, effective_tod_pref, day_exclusions, user_tz,
     )
     plan["echo"] = echo
     # The delta (numeric fields only) rides along so the client can STAGE
@@ -1475,6 +1484,7 @@ async def nudge(req: NudgeRequest, user_id: str = Depends(get_current_user)):
         raise HTTPException(status_code=429, detail="Nudge limit reached.")
 
     session = await get_session(user_id)
+    user_tz = await db.fetch_user_timezone(user_id)
     async with session.lock:
         ctx = req.context or ""
         image_bytes = base64.b64decode(req.screenshot) if req.screenshot else None
@@ -1493,7 +1503,7 @@ async def nudge(req: NudgeRequest, user_id: str = Depends(get_current_user)):
 
         try:
             message = await asyncio.wait_for(
-                generate_reply(contents, build_proactive_prompt(session, ctx), grounding=False),
+                generate_reply(contents, build_proactive_prompt(session, user_tz, ctx), grounding=False),
                 timeout=30.0,
             )
         except asyncio.TimeoutError:
@@ -1535,6 +1545,19 @@ async def nudge(req: NudgeRequest, user_id: str = Depends(get_current_user)):
 async def get_profile(user_id: str = Depends(get_current_user)):
     cfg = await db.fetch_avatar_config(user_id)
     return {"avatar_file_path": cfg["file_path"], "expression_map": cfg["expression_map"]}
+
+
+@app.post("/profile/timezone")
+async def set_profile_timezone(req: TimezoneRequest, user_id: str = Depends(get_current_user)):
+    """Timezone correctness fix (Part D): the client detects its own IANA
+    zone (Intl.DateTimeFormat().resolvedOptions().timeZone) and sends ONLY
+    the zone name here — never a client timestamp, which would invite
+    clock-skew bugs. The backend computes every "now"/"today" itself, in
+    this zone, via db.fetch_user_timezone. Called once after login and
+    whenever Settings opens, so a changed system zone (new city, laptop
+    travel) is picked up without a separate explicit action."""
+    ok = await db.update_user_timezone(user_id, req.tz)
+    return {"status": "ok" if ok else "error"}
 
 
 @app.get("/memory", response_model=MemoryResponse)

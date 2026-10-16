@@ -398,6 +398,12 @@ def place_slots(
     entry is treated as an immovable wall regardless of what it is; this
     function has no concept of "movable" or "unimportant" events.
 
+    `now` — REQUIRED, tz-aware, in the USER's zone (datetime.now(user_tz)).
+    This is a pure module — it receives the instant, it does not resolve a
+    user's timezone itself. A bare `datetime.now()` here would be the
+    HOST's local time, wrong for any user not in the host's zone (e.g.
+    the host is UTC on a cloud box).
+
     Returns up to `count` non-overlapping {"start","end"} dicts, each one
     drawn ONLY from a computed free gap — this is the structural guarantee
     that makes a double-book impossible here no matter what upstream
@@ -406,7 +412,7 @@ def place_slots(
     make up the difference.
     """
     if now is None:
-        now = datetime.now()
+        raise ValueError("place_slots requires `now` (tz-aware, in the user's zone) — callers must pass datetime.now(user_tz), not rely on a host-local default.")
     if spacing is None:
         spacing = _DEFAULT_SPACING
 

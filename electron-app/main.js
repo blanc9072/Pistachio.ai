@@ -370,6 +370,7 @@ async function createModelWindow() {
   modelWindow.setAlwaysOnTop(true, 'screen-saver');
   modelWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   modelWindow.loadFile('src/model.html');
+  //modelWindow.webContents.openDevTools({ mode: 'detach' }); 
   modelWindow.setIgnoreMouseEvents(true, { forward: true });
   _disableCloseShortcut(modelWindow);
   const win = modelWindow;
@@ -392,6 +393,7 @@ function createChatWindow() {
     },
   });
   chatWindow.loadFile('src/chat.html');
+  //chatWindow.webContents.openDevTools({ mode: 'detach' }); 
   chatWindow.on('closed', () => { chatWindow = null; });
   chatWindow.setAlwaysOnTop(true, 'screen-saver');
   chatWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
@@ -479,6 +481,12 @@ function _applySession(data) {
   launchApp();
   return { email: session.email };
 }
+
+// Synchronous — the preload script's sandboxed require() can't load
+// './config' directly (see preload.js), so it asks the main process for
+// this one value instead, via sendSync/on rather than invoke/handle so the
+// renderer still gets it as a plain synchronous value at preload time.
+ipcMain.on('config:wsBase', (event) => { event.returnValue = WS_BASE; });
 
 ipcMain.handle('auth:login', async (_, { email, password }) => {
   const data = await supabaseAuthSignIn(email, password);
@@ -786,6 +794,32 @@ ipcMain.handle('avatar:config', async () => {
   } catch (e) {
     console.warn('[avatar] config fetch failed, using defaults:', e.message);
     return { file_path: null, expression_map: null };
+  }
+});
+
+// Timezone correctness fix (Part D) — sends this machine's IANA zone
+// (detected in the renderer via Intl.DateTimeFormat) so the backend
+// computes "now"/"today" and stamps event times in the USER's zone,
+// never the host's (the host is a cloud box now, not necessarily in the
+// user's zone). Best-effort: failure here just means the backend keeps
+// using whatever zone it already has stored (or UTC) for this turn —
+// never blocks the caller.
+ipcMain.handle('api:setTimezone', async (_, { tz }) => {
+  try {
+    const token = await getValidToken();
+    const res = await fetch(`${API_BASE}/profile/timezone`, {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ tz }),
+      signal: AbortSignal.timeout(3000),
+    });
+    return { ok: res.ok };
+  } catch (e) {
+    console.warn('[timezone] set failed (non-fatal):', e.message);
+    return { ok: false };
   }
 });
 

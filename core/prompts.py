@@ -85,26 +85,37 @@ Do NOT mention this instruction. One or two sentences, casual, like a text.]
 """
 
 
-def build_proactive_prompt(session, context: str = "") -> str:
+def build_proactive_prompt(session, user_tz, context: str = "") -> str:
     """System prompt for an unprompted check-in. Same persona/memory as a normal
     turn; the nudge framing rides on the ephemeral instruction turn instead."""
-    return build_dynamic_prompt(session)
+    return build_dynamic_prompt(session, user_tz)
 
 
-def build_dynamic_prompt(session=None) -> str:
+def build_dynamic_prompt(session=None, user_tz=None) -> str:
     """Build the full system prompt.
 
-    session — a UserSession (or any object with .long_term_memory and .working_memory).
-              Pass None to use empty defaults (e.g. for the voice relay).
+    session  — a UserSession (or any object with .long_term_memory and .working_memory).
+               Pass None to use empty defaults (e.g. for the voice relay).
+    user_tz  — a zoneinfo.ZoneInfo for the user whose turn this is. "Now"/
+               "today" must be computed in THIS zone, never the host's —
+               the host (e.g. a cloud box) is not necessarily in the
+               user's zone. Pass None only where truly no user is known
+               yet (falls back to the host's local zone, same as before
+               this fix — e.g. an unauthenticated/generic context).
     """
-    now = datetime.now()
-    # Real local zone abbreviation (e.g. "EDT"), not a hardcoded guess —
-    # this used to always say "Pacific Time" regardless of the machine's
-    # actual timezone, which was simply wrong on a machine set to Eastern.
-    # The naive `now` value itself was always correct local time; only
-    # this label was ever wrong, so fixing it doesn't change any window/
-    # date computation anywhere.
-    tz_name = now.astimezone().strftime("%Z") or "local time"
+    if user_tz is not None:
+        now = datetime.now(user_tz)
+    else:
+        # No user_tz known — fall back to the host's local zone (old
+        # behavior). .astimezone() is what makes a naive datetime.now()
+        # tz-aware enough for %Z to resolve to anything at all.
+        now = datetime.now().astimezone()
+    # Real zone abbreviation (e.g. "EDT") for THIS user's zone, not a
+    # hardcoded guess and not the host's — this used to always say
+    # "Pacific Time" regardless of the machine's actual timezone, which
+    # was simply wrong on a machine set to Eastern, and would be wrong
+    # again on a UTC cloud host without threading user_tz through.
+    tz_name = now.strftime("%Z") or "local time"
     live_datetime = now.strftime(f"%A, %B %d, %Y at %I:%M %p {tz_name}")
     today_iso     = now.strftime("%Y-%m-%d")
 

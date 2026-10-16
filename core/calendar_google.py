@@ -174,14 +174,14 @@ async def enumerate_calendars(creds: Credentials | None) -> list[dict]:
     return result or []
 
 
-def _parsed_start_end(value: dict) -> tuple[str | None, bool]:
+def _parsed_start_end(value: dict, user_tz) -> tuple[str | None, bool]:
     """Google's start/end is {"dateTime": "...-04:00"} for timed events or
     {"date": "YYYY-MM-DD"} for all-day ones. Returns (local-naive ISO
-    string, is_all_day). A timed value is normalized to the SYSTEM's
-    actual local zone before stripping the offset (mirrors the old CS3
-    _snapshot_ts_to_local_iso pattern) rather than blindly trusting
-    whatever offset the event happened to carry — robust even if an event
-    was created by an organizer in a different timezone."""
+    string, is_all_day). A timed value is normalized to the USER's zone
+    (never the host's) before stripping the offset — robust even if an
+    event was created by an organizer in a different timezone, and
+    correct on a host that isn't in the user's own zone (e.g. a cloud
+    box)."""
     if "date" in value:
         try:
             d = datetime.strptime(value["date"], "%Y-%m-%d")
@@ -193,13 +193,13 @@ def _parsed_start_end(value: dict) -> tuple[str | None, bool]:
         return None, False
     try:
         aware = datetime.fromisoformat(dt_str)
-        local = aware.astimezone().replace(tzinfo=None)
+        local = aware.astimezone(user_tz).replace(tzinfo=None)
         return local.isoformat(timespec="seconds"), False
     except ValueError:
         return None, False
 
 
-def _read_one_calendar_sync(creds: Credentials, cal_id: str, cal_title: str, time_min: str, time_max: str) -> list[dict]:
+def _read_one_calendar_sync(creds: Credentials, cal_id: str, cal_title: str, time_min: str, time_max: str, user_tz) -> list[dict]:
     """One calendar, one synchronous call chain (paginated) — the unit
     read_window fans out across calendars via asyncio.to_thread, mirroring
     the old concurrent per-calendar osascript read's shape (N calendars,
@@ -222,8 +222,8 @@ def _read_one_calendar_sync(creds: Credentials, cal_id: str, cal_title: str, tim
                 pageToken=page_token,
             ).execute()
             for ev in resp.get("items", []):
-                start_val, is_all_day = _parsed_start_end(ev.get("start", {}))
-                end_val, _ = _parsed_start_end(ev.get("end", {}))
+                start_val, is_all_day = _parsed_start_end(ev.get("start", {}), user_tz)
+                end_val, _ = _parsed_start_end(ev.get("end", {}), user_tz)
                 events.append({
                     "uid": ev["id"],
                     "title": ev.get("summary", ""),
@@ -253,7 +253,7 @@ def _read_one_calendar_sync(creds: Credentials, cal_id: str, cal_title: str, tim
 
 
 async def read_window(
-    creds: Credentials | None, start_dt: datetime, end_dt: datetime, writable_only: bool,
+    creds: Credentials | None, start_dt: datetime, end_dt: datetime, writable_only: bool, user_tz,
 ) -> dict:
     """THE replacement read, Google-backed: events.list(singleEvents=True)
     expands recurring events into per-occurrence instances (the entire
@@ -295,14 +295,16 @@ async def read_window(
         # real, correct empty — not a failure to distinguish from one.
         return {"status": "ok", "events": []}
 
-    # Naive-local datetimes, same convention every other read_window
-    # caller already uses -- .astimezone() on a naive value presumes
-    # system-local time and attaches the correct (DST-aware) offset.
-    time_min = start_dt.astimezone().isoformat()
-    time_max = end_dt.astimezone().isoformat()
+    # Naive-local datetimes represent wall-clock time in the USER's zone
+    # (not the host's) — .replace(tzinfo=user_tz) attaches that zone
+    # directly with no conversion, unlike .astimezone() which would
+    # presume the HOST's local zone (wrong on a cloud box not in the
+    # user's zone).
+    time_min = start_dt.replace(tzinfo=user_tz).isoformat()
+    time_max = end_dt.replace(tzinfo=user_tz).isoformat()
 
     per_cal_results = await asyncio.gather(*(
-        asyncio.to_thread(_read_one_calendar_sync, creds, c["id"], c["title"], time_min, time_max)
+        asyncio.to_thread(_read_one_calendar_sync, creds, c["id"], c["title"], time_min, time_max, user_tz)
         for c in targets
     ))
 
@@ -420,7 +422,7 @@ async def _delete_event_raw(creds, calendar_id: str, event_id: str) -> str:
 
 
 def _confirm_gone_sync(
-    creds: Credentials, calendar_id: str, event_id: str, start_dt: datetime, end_dt: datetime,
+    creds: Credentials, calendar_id: str, event_id: str, start_dt: datetime, end_dt: datetime, user_tz,
 ) -> bool:
     """SNAG #4 — the real post-delete "is it gone" check: events.list
     over a window bracketing the event's own original time (default
@@ -429,11 +431,13 @@ def _confirm_gone_sync(
     that can still return 200 with status:"cancelled" for a while after a
     genuinely successful delete, which would false-fail this check if
     treated as "still there". On any exception, fails safe toward "not
-    confirmed" — never report a delete as successful on a guess."""
+    confirmed" — never report a delete as successful on a guess.
+    start_dt/end_dt are naive wall-clock in the USER's zone — interpreted
+    via user_tz, never the host's local zone."""
     try:
         service = _build_service("calendar", "v3", credentials=creds)
-        time_min = (start_dt - timedelta(hours=2)).astimezone().isoformat()
-        time_max = (end_dt + timedelta(hours=2)).astimezone().isoformat()
+        time_min = (start_dt - timedelta(hours=2)).replace(tzinfo=user_tz).isoformat()
+        time_max = (end_dt + timedelta(hours=2)).replace(tzinfo=user_tz).isoformat()
         resp = service.events().list(
             calendarId=calendar_id, timeMin=time_min, timeMax=time_max, singleEvents=True,
         ).execute()
@@ -473,7 +477,7 @@ def _confirm_series_gone_sync(creds: Credentials, calendar_id: str, master_id: s
         return False
 
 
-async def find_candidates(title_fragment: str, date_str: str | None, creds: Credentials | None) -> tuple[str, str, list]:
+async def find_candidates(title_fragment: str, date_str: str | None, creds: Credentials | None, user_tz) -> tuple[str, str, list]:
     """Google equivalent of calendar_executor._find_candidates: the SAME
     exact/approximate matching logic, reused directly (byte-identical
     behavior — _normalize_title/_titles_match/_osa_distance/
@@ -486,8 +490,8 @@ async def find_candidates(title_fragment: str, date_str: str | None, creds: Cred
     if creds is None:
         return "needs_connection", "none", []
 
-    start_dt, end_dt = _resolve_delete_window(date_str)
-    read = await read_window(creds, start_dt, end_dt, writable_only=True)
+    start_dt, end_dt = _resolve_delete_window(date_str, user_tz)
+    read = await read_window(creds, start_dt, end_dt, writable_only=True, user_tz=user_tz)
     if read["status"] == "needs_connection":
         return "needs_connection", "none", []
     if read["status"] != "ok":
@@ -518,22 +522,24 @@ async def find_candidates(title_fragment: str, date_str: str | None, creds: Cred
     return "ok", "none", []
 
 
-def _event_body(start_dt: datetime, end_dt: datetime, all_day: bool) -> dict:
+def _event_body(start_dt: datetime, end_dt: datetime, all_day: bool, user_tz) -> dict:
     if all_day:
         return {
             "start": {"date": start_dt.strftime("%Y-%m-%d")},
             "end": {"date": end_dt.strftime("%Y-%m-%d")},
         }
-    # .astimezone() on a naive datetime presumes system-local time and
-    # attaches the correct (DST-aware) offset directly in the ISO string —
-    # no separate timeZone field needed, and no hardcoded zone name.
+    # start_dt/end_dt are naive wall-clock in the USER's zone — stamp
+    # THAT zone's offset directly via replace(tzinfo=user_tz), no
+    # conversion. .astimezone() would instead presume the HOST's local
+    # zone, wrong on a cloud box not in the user's zone — "7pm" must be
+    # 7pm for the user, not 7pm host-time.
     return {
-        "start": {"dateTime": start_dt.astimezone().isoformat()},
-        "end": {"dateTime": end_dt.astimezone().isoformat()},
+        "start": {"dateTime": start_dt.replace(tzinfo=user_tz).isoformat()},
+        "end": {"dateTime": end_dt.replace(tzinfo=user_tz).isoformat()},
     }
 
 
-def _create_event_sync(args: dict, enabled: bool, creds: Credentials | None, calendar_id: str | None) -> dict:
+def _create_event_sync(args: dict, enabled: bool, creds: Credentials | None, calendar_id: str | None, user_tz) -> dict:
     title   = (args.get("title") or "").strip()
     start_s = (args.get("start") or "").strip()
     end_s   = (args.get("end") or "").strip()
@@ -573,7 +579,7 @@ def _create_event_sync(args: dict, enabled: bool, creds: Credentials | None, cal
     # osascript's `first calendar whose writable is true` happened to
     # pick. A per-user default-target-calendar preference is a follow-on.
     target_cal = calendar_id or "primary"
-    body = {"summary": title, **_event_body(start_dt, end_dt, all_day)}
+    body = {"summary": title, **_event_body(start_dt, end_dt, all_day, user_tz)}
 
     try:
         service = _build_service("calendar", "v3", credentials=creds)
@@ -591,19 +597,19 @@ def _create_event_sync(args: dict, enabled: bool, creds: Credentials | None, cal
         return ExecutionResult(status="error", message="Couldn't create the event.", **result_kwargs).to_dict()
 
 
-async def create_event(args: dict, enabled: bool, creds: Credentials | None, calendar_id: str | None = None) -> dict:
+async def create_event(args: dict, enabled: bool, creds: Credentials | None, user_tz, calendar_id: str | None = None) -> dict:
     """Create a calendar event — same args/enabled contract as calendar_
     executor.create_calendar_event, plus `creds` (this user's built
     credentials) and `calendar_id` (defaults to "primary" — see
     _create_event_sync). Never raises; returns the identical {status,
     message, title, start, end, all_day} shape (via ExecutionResult,
     reused directly)."""
-    return await _run(lambda: _create_event_sync(args, enabled, creds, calendar_id))
+    return await _run(lambda: _create_event_sync(args, enabled, creds, calendar_id, user_tz))
 
 
 async def move_by_uid(
     uid: str, calendar: str, new_start: str, new_end: str | None, enabled: bool,
-    creds: Credentials | None, scope: str | None = None,
+    creds: Credentials | None, user_tz, scope: str | None = None,
 ) -> dict:
     """The guarded single-event move — app_disabled/needs_connection gate,
     recurrence handling, re-verify, duration-preserving new_end
@@ -647,8 +653,8 @@ async def move_by_uid(
             return _move_result("error", "Couldn't check that event.")
 
         title = ev.get("summary") or ""
-        orig_start_val, is_all_day = _parsed_start_end(ev.get("start", {}))
-        orig_end_val, _ = _parsed_start_end(ev.get("end", {}))
+        orig_start_val, is_all_day = _parsed_start_end(ev.get("start", {}), user_tz)
+        orig_end_val, _ = _parsed_start_end(ev.get("end", {}), user_tz)
         recurring = _is_recurring(ev)
 
         if recurring and scope is None:
@@ -688,8 +694,8 @@ async def move_by_uid(
             # date; never relocate the series to the user's occurrence
             # date (that would silently move every future occurrence to a
             # single day instead of recurring).
-            m_start_val, _ = _parsed_start_end(ev2.get("start", {}))
-            m_end_val, _ = _parsed_start_end(ev2.get("end", {}))
+            m_start_val, _ = _parsed_start_end(ev2.get("start", {}), user_tz)
+            m_end_val, _ = _parsed_start_end(ev2.get("end", {}), user_tz)
             m_start_dt = _parse_dt(m_start_val)
             m_end_dt = _parse_dt(m_end_val)
             if m_start_dt is None or m_end_dt is None:
@@ -702,8 +708,8 @@ async def move_by_uid(
         else:
             new_write_start = new_start_dt
             if new_end_dt is None:
-                orig_t_start_val, _ = _parsed_start_end(ev2.get("start", {}))
-                orig_t_end_val, _ = _parsed_start_end(ev2.get("end", {}))
+                orig_t_start_val, _ = _parsed_start_end(ev2.get("start", {}), user_tz)
+                orig_t_end_val, _ = _parsed_start_end(ev2.get("end", {}), user_tz)
                 orig_t_start_dt = _parse_dt(orig_t_start_val)
                 orig_t_end_dt = _parse_dt(orig_t_end_val)
                 if orig_t_start_dt is None or orig_t_end_dt is None:
@@ -712,7 +718,7 @@ async def move_by_uid(
             else:
                 new_write_end = new_end_dt
 
-        body = _event_body(new_write_start, new_write_end, is_all_day)
+        body = _event_body(new_write_start, new_write_end, is_all_day, user_tz)
         patch_status, _patched = await _patch_event(creds, calendar, target_id, body)
         if patch_status == "not_found":
             return _move_result("not_found", "that event's no longer there", title=title, start=orig_start_val)
@@ -725,8 +731,8 @@ async def move_by_uid(
         confirm_status, confirm_ev = await _get_event(creds, calendar, target_id)
         if confirm_status != "ok":
             return _move_result("error", "Couldn't confirm the move.", title=title)
-        confirmed_start_val, _ = _parsed_start_end(confirm_ev.get("start", {}))
-        confirmed_end_val, _ = _parsed_start_end(confirm_ev.get("end", {}))
+        confirmed_start_val, _ = _parsed_start_end(confirm_ev.get("start", {}), user_tz)
+        confirmed_end_val, _ = _parsed_start_end(confirm_ev.get("end", {}), user_tz)
         if _parse_dt(confirmed_start_val) != new_write_start or _parse_dt(confirmed_end_val) != new_write_end:
             log.warning(
                 "[google-write] move did not confirm for target=%s (intended %s-%s, actual %s-%s) — "
@@ -745,7 +751,7 @@ async def move_by_uid(
         return _move_result("error", "Couldn't move that event.")
 
 
-async def move_event(args: dict, enabled: bool, creds: Credentials | None) -> dict:
+async def move_event(args: dict, enabled: bool, creds: Credentials | None, user_tz) -> dict:
     """Move one specific event, by uid+calendar (skips candidate search)
     or by title fragment — same target-resolution contract as calendar_
     executor.move_event, reusing find_candidates verbatim. Never raises;
@@ -767,12 +773,12 @@ async def move_event(args: dict, enabled: bool, creds: Credentials | None) -> di
     title_fragment = (args.get("title") or "").strip()
 
     if uid and calendar:
-        return await move_by_uid(uid, calendar, new_start_s, new_end_s, enabled, creds)
+        return await move_by_uid(uid, calendar, new_start_s, new_end_s, enabled, creds, user_tz)
 
     if not title_fragment:
         return _move_result("error", "Couldn't tell which event to move.")
 
-    q_status, tier, candidates = await find_candidates(title_fragment, args.get("date"), creds)
+    q_status, tier, candidates = await find_candidates(title_fragment, args.get("date"), creds, user_tz)
     if q_status == "needs_connection":
         return _move_result("needs_connection", "Google Calendar isn't connected.")
     if q_status != "ok":
@@ -783,7 +789,7 @@ async def move_event(args: dict, enabled: bool, creds: Credentials | None) -> di
 
     if tier == "exact" and len(candidates) == 1:
         return await move_by_uid(
-            candidates[0]["uid"], candidates[0]["calendar"], new_start_s, new_end_s, enabled, creds,
+            candidates[0]["uid"], candidates[0]["calendar"], new_start_s, new_end_s, enabled, creds, user_tz,
         )
 
     return _move_result(
@@ -800,7 +806,7 @@ async def move_event(args: dict, enabled: bool, creds: Credentials | None) -> di
 
 
 async def delete_by_uid(
-    uid: str, calendar: str, enabled: bool, creds: Credentials | None, scope: str | None = None,
+    uid: str, calendar: str, enabled: bool, creds: Credentials | None, user_tz, scope: str | None = None,
 ) -> dict:
     """The guarded single-event delete — app_disabled/needs_connection
     gate, recurrence handling, re-verify, delete, and SNAG #4's
@@ -837,8 +843,8 @@ async def delete_by_uid(
             return _delete_result("error", "Couldn't check that event.")
 
         title = ev.get("summary") or ""
-        start_val, _ = _parsed_start_end(ev.get("start", {}))
-        end_val, _ = _parsed_start_end(ev.get("end", {}))
+        start_val, _ = _parsed_start_end(ev.get("start", {}), user_tz)
+        end_val, _ = _parsed_start_end(ev.get("end", {}), user_tz)
         all_day = bool(ev.get("start", {}).get("date"))
         recurring = _is_recurring(ev)
 
@@ -867,9 +873,9 @@ async def delete_by_uid(
         if status2 != "ok":
             return _delete_result("error", "Couldn't verify that event.", title=title)
 
-        t_start_val, _ = _parsed_start_end(ev2.get("start", {}))
-        t_end_val, _ = _parsed_start_end(ev2.get("end", {}))
-        t_start_dt = _parse_dt(t_start_val) or datetime.now()
+        t_start_val, _ = _parsed_start_end(ev2.get("start", {}), user_tz)
+        t_end_val, _ = _parsed_start_end(ev2.get("end", {}), user_tz)
+        t_start_dt = _parse_dt(t_start_val) or datetime.now(user_tz).replace(tzinfo=None)
         t_end_dt = _parse_dt(t_end_val) or t_start_dt
 
         del_status = await _delete_event_raw(creds, calendar, target_id)
@@ -885,7 +891,7 @@ async def delete_by_uid(
         if recurring and scope == "series":
             gone = await _run(lambda: _confirm_series_gone_sync(creds, calendar, target_id))
         else:
-            gone = await _run(lambda: _confirm_gone_sync(creds, calendar, target_id, t_start_dt, t_end_dt))
+            gone = await _run(lambda: _confirm_gone_sync(creds, calendar, target_id, t_start_dt, t_end_dt, user_tz))
         if not gone:
             log.warning(
                 "[google-write] delete did not confirm removal for target=%s (scope=%s) — "
@@ -901,7 +907,7 @@ async def delete_by_uid(
         return _delete_result("error", "Couldn't delete that event.")
 
 
-async def delete_event(args: dict, enabled: bool, creds: Credentials | None) -> dict:
+async def delete_event(args: dict, enabled: bool, creds: Credentials | None, user_tz) -> dict:
     """Delete one specific event, by uid+calendar (skips candidate
     search) or by title fragment — same target-resolution contract as
     calendar_executor.delete_event, reusing find_candidates verbatim.
@@ -916,12 +922,12 @@ async def delete_event(args: dict, enabled: bool, creds: Credentials | None) -> 
     title_fragment = (args.get("title") or "").strip()
 
     if uid and calendar:
-        return await delete_by_uid(uid, calendar, enabled, creds)
+        return await delete_by_uid(uid, calendar, enabled, creds, user_tz)
 
     if not title_fragment:
         return _delete_result("error", "Couldn't tell which event to delete.")
 
-    q_status, tier, candidates = await find_candidates(title_fragment, args.get("date"), creds)
+    q_status, tier, candidates = await find_candidates(title_fragment, args.get("date"), creds, user_tz)
     if q_status == "needs_connection":
         return _delete_result("needs_connection", "Google Calendar isn't connected.")
     if q_status != "ok":
@@ -931,7 +937,7 @@ async def delete_event(args: dict, enabled: bool, creds: Credentials | None) -> 
         return _delete_result("not_found", "couldn't find that event")
 
     if tier == "exact" and len(candidates) == 1:
-        return await delete_by_uid(candidates[0]["uid"], candidates[0]["calendar"], enabled, creds)
+        return await delete_by_uid(candidates[0]["uid"], candidates[0]["calendar"], enabled, creds, user_tz)
 
     return _delete_result(
         "disambiguate",

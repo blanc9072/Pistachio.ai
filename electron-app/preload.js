@@ -1,11 +1,15 @@
 const { contextBridge, ipcRenderer } = require('electron');
-const { WS_BASE } = require('./config');
 
 contextBridge.exposeInMainWorld('electronAPI', {
   // Voice relay base URL (ws://localhost:8765 local dev, wss://<DOMAIN>/ws
-  // once cloud-deployed — see config.js). A plain value, not an IPC call:
-  // config.js is static, read once at preload time.
-  voiceWsUrl: WS_BASE,
+  // once cloud-deployed — see config.js). A sandboxed preload script can't
+  // require() arbitrary local files (only a small Node builtin allowlist is
+  // available — requiring './config' here throws "module not found" and
+  // silently kills preload entirely, taking down window.electronAPI and
+  // every IPC call with it). sendSync asks the main process instead, which
+  // CAN read config.js normally, and blocks until it answers — same
+  // synchronous value at the call site, just resolved via IPC underneath.
+  voiceWsUrl: ipcRenderer.sendSync('config:wsBase'),
 
   // ── Model window ──────────────────────────────────────────────────────────
   onMouseMove:     (cb)     => ipcRenderer.on('mouse-move', (_, pos) => cb(pos)),
@@ -13,6 +17,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startDrag:       (offset) => ipcRenderer.send('start-drag', offset),
   endDrag:         ()       => ipcRenderer.send('end-drag'),
   getAvatarConfig: ()       => ipcRenderer.invoke('avatar:config'),
+  setTimezone:     (tz)     => ipcRenderer.invoke('api:setTimezone', { tz }),
 
   // ── Chat window ───────────────────────────────────────────────────────────
   onToggleMic:    (cb) => ipcRenderer.on('toggle-mic', cb),

@@ -8,7 +8,14 @@ from dotenv import load_dotenv
 log = logging.getLogger(__name__)
 
 load_dotenv()
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google-key.json"
+# This module is imported (and constructs gemini_client, eagerly resolving
+# credentials) BEFORE main.py reaches its own setdefault line — a hardcoded
+# unconditional assignment here would win every time, silently ignoring
+# VERTEX_KEY_PATH on the box (where the key lives at
+# /etc/pistachio/google-key.json, not this relative path). setdefault here
+# instead, mirroring main.py's line exactly, so whichever one of the two
+# runs first resolves to the same value and order no longer matters.
+os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", os.getenv("VERTEX_KEY_PATH", "google-key.json"))
 
 # Fine-tuned Vertex 2.5 chat brain (fallback) — set CHAT_MODEL to this to swap back:
 #   projects/andrewgpt-490605/locations/us-west1/endpoints/9200944198671400960

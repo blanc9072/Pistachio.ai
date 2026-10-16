@@ -473,15 +473,18 @@ async def _read_calendars_concurrent(
     return {"status": "success", "events": events, "unreachable": unreachable}
 
 
-def _resolve_list_date(date_str: str | None) -> datetime:
-    """Target day at local midnight. Defaults to tomorrow when `date_str`
-    is absent or not a parseable ISO date — never raises."""
+def _resolve_list_date(date_str: str | None, user_tz=None) -> datetime:
+    """Target day at local midnight, in `user_tz` if given (falls back to
+    the host's zone if not — callers should always pass it; this default
+    only covers any caller not yet updated). Defaults to tomorrow when
+    `date_str` is absent or not a parseable ISO date — never raises."""
     if date_str:
         try:
             return datetime.strptime(date_str.strip(), "%Y-%m-%d")
         except ValueError:
             pass
-    return (datetime.now() + timedelta(days=1)).replace(
+    now = datetime.now(user_tz) if user_tz is not None else datetime.now()
+    return (now.replace(tzinfo=None) + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
 
@@ -799,19 +802,22 @@ def _titles_match(query_norm: str, event_title_norm: str) -> bool:
     return query_norm in event_title_norm or event_title_norm in query_norm
 
 
-def _resolve_delete_window(date_str: str | None) -> tuple[datetime, datetime]:
-    """Search window for delete candidates. An explicit, parseable date
-    scopes to that single day (unchanged from before). No date — or an
-    unparseable one — WIDENS to today..+7 days, so two same-titled events
-    on different days both surface instead of only whichever one an
-    assumed single day happened to contain."""
+def _resolve_delete_window(date_str: str | None, user_tz=None) -> tuple[datetime, datetime]:
+    """Search window for delete candidates, in `user_tz` if given (falls
+    back to the host's zone if not — callers should always pass it; this
+    default only covers any caller not yet updated). An explicit,
+    parseable date scopes to that single day (unchanged from before). No
+    date — or an unparseable one — WIDENS to today..+7 days, so two
+    same-titled events on different days both surface instead of only
+    whichever one an assumed single day happened to contain."""
     if date_str:
         try:
             day = datetime.strptime(date_str.strip(), "%Y-%m-%d")
             return day, day.replace(hour=23, minute=59, second=59)
         except ValueError:
             pass
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.now(user_tz) if user_tz is not None else datetime.now()
+    today = now.replace(tzinfo=None, hour=0, minute=0, second=0, microsecond=0)
     end = (today + timedelta(days=7)).replace(hour=23, minute=59, second=59)
     return today, end
 

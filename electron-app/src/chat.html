@@ -860,7 +860,12 @@
       case 'os_denied':
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
       case 'needs_permission':
-        return 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
+        // Backend-agnostic status code (see api/routes.py's list_events) —
+        // the message is backend-correct (EventKit permission text OR
+        // "Google Calendar isn't connected", whichever actually applies);
+        // never assume it's the EventKit one just because the status name
+        // says "permission".
+        return action.message || 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
       case 'needs_connection':
         return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "error", plus any status this build doesn't know yet
@@ -1160,7 +1165,12 @@
       case 'os_denied':
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
       case 'needs_permission':
-        return 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
+        // Backend-agnostic status code (see api/routes.py's list_events) —
+        // the message is backend-correct (EventKit permission text OR
+        // "Google Calendar isn't connected", whichever actually applies);
+        // never assume it's the EventKit one just because the status name
+        // says "permission".
+        return action.message || 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
       case 'needs_connection':
         return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "error"
@@ -1191,7 +1201,12 @@
       case 'os_denied':
         return 'macOS is blocking me — enable it in System Settings › Privacy & Security';
       case 'needs_permission':
-        return 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
+        // Backend-agnostic status code (see api/routes.py's list_events) —
+        // the message is backend-correct (EventKit permission text OR
+        // "Google Calendar isn't connected", whichever actually applies);
+        // never assume it's the EventKit one just because the status name
+        // says "permission".
+        return action.message || 'I need Calendar access — grant Full Calendar access in System Settings › Privacy & Security › Calendars';
       case 'needs_connection':
         return action.message || "Google Calendar isn't connected — connect it in Settings";
       default:   // "error"
@@ -2324,6 +2339,10 @@
                             // popup" listener below and closes it right back
     closeOverlay();
     openSettingsPopup();
+    // Re-send on every settings open too (not just login) — catches a
+    // changed system zone (new city, laptop travel) without needing a
+    // separate explicit action; see the login-time call above.
+    window.electronAPI.setTimezone?.(Intl.DateTimeFormat().resolvedOptions().timeZone);
   });
 
   // Clicking anywhere outside the popup returns to the account menu —
@@ -2678,6 +2697,15 @@
     document.getElementById('ovName').textContent         = USERNAME;
     document.getElementById('ovEmail').textContent        = u.email;
   });
+
+  // Timezone correctness fix (Part D) — sends this machine's IANA zone
+  // once after login, so the backend's "now"/"today" and every event
+  // time it computes are in THIS user's zone, not the host's (the
+  // backend runs on a cloud box now, not necessarily in the user's
+  // zone). Best-effort fire-and-forget — setTimezone itself never
+  // throws (see main.js), and a failure here just leaves the backend on
+  // whatever zone it already has stored for this user.
+  window.electronAPI.setTimezone?.(Intl.DateTimeFormat().resolvedOptions().timeZone);
 
   </script>
 </body>

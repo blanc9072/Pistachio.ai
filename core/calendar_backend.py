@@ -66,7 +66,7 @@ async def _creds(user_id: str):
 
 
 # ---- READS -----------------------------------------------------------------
-async def read_window(user_id, start_dt, end_dt, writable_only) -> dict:
+async def read_window(user_id, start_dt, end_dt, writable_only, user_tz) -> dict:
     """Normalized read. Returns:
          {"status": "ok",          "events": [...]}
          {"status": "needs_setup", "events": [], "message": <provider msg>}
@@ -75,9 +75,14 @@ async def read_window(user_id, start_dt, end_dt, writable_only) -> dict:
     (Google) both normalize to 'needs_setup' here, with setup_message()
     attached, so routes' read consumers branch on ONE sentinel regardless
     of backend. Event-dict shape is identical across providers already
-    ({uid,title,start,end,all_day,calendar})."""
+    ({uid,title,start,end,all_day,calendar}).
+
+    user_tz — the user's zoneinfo.ZoneInfo (timezone correctness fix):
+    Google-only, same reasoning as `scope` below — EventKit is local,
+    single-user, same-machine, so the host's own zone already IS the
+    user's zone there; it's ignored on that branch."""
     if _BACKEND == "google":
-        r = await gcal.read_window(await _creds(user_id), start_dt, end_dt, writable_only)
+        r = await gcal.read_window(await _creds(user_id), start_dt, end_dt, writable_only, user_tz)
         native_setup = "needs_connection"
     else:
         r = await ek_read.read_window(start_dt, end_dt, writable_only)
@@ -98,40 +103,41 @@ async def read_window(user_id, start_dt, end_dt, writable_only) -> dict:
 # that surfaces action.message (Google always sets a correct one), so the
 # client needs no change for correctness — PART E is optional polish only.
 # These therefore pass provider results straight through, unnormalized.
-async def create_event(user_id, args, enabled) -> dict:
+async def create_event(user_id, args, enabled, user_tz) -> dict:
+    # user_tz: Google-only (see read_window's docstring above for why).
     if _BACKEND == "google":
         # calendar_id comes from _WRITE_CAL (prod: "primary"; test: the
         # throwaway calendar) — this is the ONE place the write target is
         # decided, so chat-create AND add_slots-create both honor it.
-        return await gcal.create_event(args, enabled, await _creds(user_id), calendar_id=_WRITE_CAL)
+        return await gcal.create_event(args, enabled, await _creds(user_id), user_tz, calendar_id=_WRITE_CAL)
     return await ek_exec.create_calendar_event(args, enabled)
 
 
-async def move_event(user_id, args, enabled) -> dict:
+async def move_event(user_id, args, enabled, user_tz) -> dict:
     if _BACKEND == "google":
-        return await gcal.move_event(args, enabled, await _creds(user_id))
+        return await gcal.move_event(args, enabled, await _creds(user_id), user_tz)
     return await ek_exec.move_event(args, enabled)
 
 
-async def move_by_uid(user_id, uid, calendar, new_start, new_end, enabled, scope=None) -> dict:
+async def move_by_uid(user_id, uid, calendar, new_start, new_end, enabled, user_tz, scope=None) -> dict:
     # scope (G4): None | "instance" | "series" — Google-only. A recurring
     # target with scope=None returns "recurring_choice" instead of acting
     # (see calendar_google.move_by_uid). The eventkit path has no way to
     # address a single occurrence safely, so it ignores scope entirely
     # and keeps refusing recurring events outright, unchanged.
     if _BACKEND == "google":
-        return await gcal.move_by_uid(uid, calendar, new_start, new_end, enabled, await _creds(user_id), scope=scope)
+        return await gcal.move_by_uid(uid, calendar, new_start, new_end, enabled, await _creds(user_id), user_tz, scope=scope)
     return await ek_exec.move_by_uid(uid, calendar, new_start, new_end, enabled)
 
 
-async def delete_event(user_id, args, enabled) -> dict:
+async def delete_event(user_id, args, enabled, user_tz) -> dict:
     if _BACKEND == "google":
-        return await gcal.delete_event(args, enabled, await _creds(user_id))
+        return await gcal.delete_event(args, enabled, await _creds(user_id), user_tz)
     return await ek_exec.delete_event(args, enabled)
 
 
-async def delete_by_uid(user_id, uid, calendar, enabled, scope=None) -> dict:
+async def delete_by_uid(user_id, uid, calendar, enabled, user_tz, scope=None) -> dict:
     # scope (G4): see move_by_uid above — same Google-only semantics.
     if _BACKEND == "google":
-        return await gcal.delete_by_uid(uid, calendar, enabled, await _creds(user_id), scope=scope)
+        return await gcal.delete_by_uid(uid, calendar, enabled, await _creds(user_id), user_tz, scope=scope)
     return await ek_exec.delete_by_uid(uid, calendar, enabled)

@@ -178,12 +178,15 @@ class ResolvedAction:
 # ---------------------------------------------------------------------------
 
 def _system_instruction(now: datetime) -> str:
-    # Real local zone abbreviation (e.g. "EDT"), not a hardcoded guess —
-    # this used to always say "Pacific Time" regardless of the machine's
-    # actual timezone. `now` itself was always correct local time; only
-    # this label was ever wrong, so fixing it doesn't shift any date/
-    # window computation anywhere.
-    tz_name = now.astimezone().strftime("%Z") or "local time"
+    # Real zone abbreviation (e.g. "EDT") for whatever zone `now` is
+    # already in — never re-derive it from the host. If `now` arrived
+    # naive (no user_tz was available), .astimezone() falls back to the
+    # host's local zone, same as the old behavior; if it's already
+    # tz-aware (the normal case, via user_tz), calling .astimezone()
+    # again would silently SHIFT it to the host's zone, so that's
+    # skipped entirely for an aware `now`.
+    aware_now = now if now.tzinfo is not None else now.astimezone()
+    tz_name = aware_now.strftime("%Z") or "local time"
     today_human = now.strftime(f"%A, %B %d, %Y at %I:%M %p {tz_name}")
     today_iso   = now.strftime("%Y-%m-%d")
     tomorrow    = (now + timedelta(days=1)).strftime("%A, %B %d, %Y")
@@ -375,14 +378,20 @@ def _validate(tool: str, args: dict, now: datetime) -> str | None:
 
 async def resolve_calendar_action(
     action_request: str,
+    user_tz=None,
     now: datetime | None = None,
 ) -> ResolvedAction:
     """Parse a plain-English calendar request into a ResolvedAction.
 
+    user_tz — the user's zoneinfo.ZoneInfo, so "today"/"now" in the
+              resolver's system instruction (and therefore any date/time
+              it infers, like "tomorrow" or "7pm") is the USER's today,
+              not the host's. Ignored if `now` is passed explicitly
+              (tests / callers that already have a concrete instant).
     Never raises — all exceptions are caught and returned as status="error".
     """
     if now is None:
-        now = datetime.now()
+        now = datetime.now(user_tz) if user_tz is not None else datetime.now()
 
     try:
         resp = await asyncio.wait_for(

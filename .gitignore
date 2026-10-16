@@ -218,6 +218,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 google-key.json
+# Google OAuth client credential files, downloaded directly from the
+# console (e.g. for the Phase 2 OCI web-app client) — same secret class as
+# google-key.json above. Matches Google's own download naming convention
+# exactly, so a fresh download is ignored automatically, not just this one.
+client_secret_*.json
 __pycache__/
 
 instagram-*/
@@ -230,3 +235,4 @@ node_modules/
 .supabase/
 supabase/.env
 supabase/.branches/
+client_secret_111280656956-ql6okh2pfgfq40k535i21mnhisqf0n42.apps.googleusercontent.com.json
